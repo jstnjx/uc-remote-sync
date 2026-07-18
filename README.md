@@ -34,15 +34,14 @@ npm run package
 Generated files:
 
 ```text
-remote-sync-0.5.3.tar.gz
-remote-sync-0.5.3.tar.gz.sha256
+remote-sync-<version>.tar.gz
+remote-sync-<version>.tar.gz.sha256
 ```
 
-The `build.yml` workflow performs the same validation, builds the Remote archive, verifies its contents and checksum, and uploads both files as a workflow artifact.
 
 ## Install on Remote Two/3
 
-1. Download `remote-sync-0.5.3.tar.gz` from the GitHub release or build it locally.
+1. Download `remote-sync-<version>.tar.gz` from the GitHub release or build it locally.
 2. Open **Web Configurator → Integrations → Add new → Install custom**.
 3. Select the archive.
 4. For an existing installation, choose **Update existing driver**.
@@ -68,7 +67,7 @@ ghcr.io/jstnjx/uc-remote-sync:latest
 Pin a specific image tag:
 
 ```bash
-REMOTE_SYNC_IMAGE=ghcr.io/jstnjx/uc-remote-sync:0.5.3 docker compose up -d
+REMOTE_SYNC_IMAGE=ghcr.io/jstnjx/uc-remote-sync:latest docker compose up -d
 ```
 
 Build the image locally instead of pulling it:
@@ -126,12 +125,6 @@ A systemd unit template is included at `deploy/remote-sync.service`.
 | `11082` | Unfolded Circle integration API |
 | `11083` | Child-side virtual Dock WebSocket server |
 
-## GitHub workflows
-
-- `build.yml`: validates, tests, packages and uploads the Remote installation archive.
-- `release.yml`: calls `build.yml` and attaches the archive and checksum to tagged GitHub releases.
-- `ghcr.yml`: builds and publishes the multi-architecture GHCR image.
-
 ## License
 
-MIT
+This project is licensed under the MIT License. See [LICENSE](LICENSE).
