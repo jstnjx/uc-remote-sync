@@ -7,7 +7,7 @@
   },
   "icon": "custom:remote-sync.png",
   "description": {
-    "en": "Mirror a primary Unfolded Circle remote and proxy its Dock 3 to satellite remotes through authenticated tunnels."
+    "en": "Synchronize activities, profiles, pages, entities, states, and commands from a primary Unfolded Circle Remote to satellite remotes, with Dock 3 access through authenticated tunnels."
   },
   "port": 11082,
   "developer": {
@@ -28,7 +28,7 @@
         "field": {
           "label": {
             "value": {
-              "en": "Choose Primary or Satellite. Satellite setup only requires the Web Configurator PIN; primary setup uses a guided three-step wizard, discovers satellites that are ready to pair, and detects WoWLAN network details automatically."
+              "en": "Choose Primary or Satellite. Satellite setup only requires the Web Configurator PIN; primary setup uses a guided three-step wizard, discovers satellites that are ready to pair."
             }
           }
         }
