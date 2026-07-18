@@ -67,7 +67,7 @@ ghcr.io/jstnjx/uc-remote-sync:latest
 Pin a specific image tag:
 
 ```bash
-REMOTE_SYNC_IMAGE=ghcr.io/jstnjx/uc-remote-sync:latest docker compose up -d
+REMOTE_SYNC_IMAGE=ghcr.io/jstnjx/uc-remote-sync:0.5.3 docker compose up -d
 ```
 
 Build the image locally instead of pulling it:
