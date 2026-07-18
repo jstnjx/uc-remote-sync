@@ -7,4 +7,4 @@ config/*.json
 data/*.json
 !config/.gitkeep
 !data/.gitkeep
-tests/
+tests/*.js

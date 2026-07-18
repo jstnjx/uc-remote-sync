@@ -56,8 +56,14 @@ jobs:
 
           echo "version=${package_version}" >> "$GITHUB_OUTPUT"
 
-      - name: Check source, run tests and build package
-        run: npm run package
+      - name: Check source
+        run: node tools/check-source.js
+
+      - name: Build Remote package
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash tools/build_embedded.sh
 
       - name: Validate Remote package
         shell: bash
@@ -83,10 +89,16 @@ jobs:
           test ! -e verify/bin/driver.exe
 
           node --check verify/bin/driver.js
+
           test "$(node -p "JSON.parse(require('fs').readFileSync('verify/driver.json', 'utf8')).version")" = "$version"
 
           if find verify -type l -print -quit | grep -q .; then
             echo "Package contains forbidden symbolic links" >&2
+            exit 1
+          fi
+
+          if find verify -path "*/tests/*.js" -print -quit | grep -q .; then
+            echo "Package contains test files" >&2
             exit 1
           fi
 
