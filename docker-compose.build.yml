@@ -1,0 +1,6 @@
+services:
+  remote-sync:
+    build:
+      context: .
+    image: uc-remote-sync:local
+    pull_policy: never

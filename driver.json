@@ -1,0 +1,39 @@
+{
+  "driver_id": "remote_sync",
+  "version": "0.5.3",
+  "min_core_api": "0.17.0",
+  "name": {
+    "en": "Remote Sync"
+  },
+  "icon": "custom:remote-sync.png",
+  "description": {
+    "en": "Mirror a master Unfolded Circle remote and proxy its Dock 3 to child remotes through authenticated tunnels."
+  },
+  "port": 11082,
+  "developer": {
+    "name": "jstnjx",
+    "url": "https://github.com/jstnjx"
+  },
+  "home_page": "https://github.com/jstnjx/uc-remote-sync",
+  "setup_data_schema": {
+    "title": {
+      "en": "Remote Sync setup"
+    },
+    "settings": [
+      {
+        "id": "info",
+        "label": {
+          "en": "Setup"
+        },
+        "field": {
+          "label": {
+            "value": {
+              "en": "Choose Master or Child. Child setup only requires the Web Configurator PIN; master setup discovers children that are ready to pair."
+            }
+          }
+        }
+      }
+    ]
+  },
+  "release_date": "2026-07-18"
+}

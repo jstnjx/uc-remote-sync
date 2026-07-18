@@ -1,0 +1,10 @@
+node_modules
+dist
+package
+.git
+.github
+tests
+*.tar.gz
+*.sha256
+config/*
+data/*

@@ -1,0 +1,26 @@
+[Unit]
+Description=Unfolded Circle Remote Sync
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=remote-sync
+Group=remote-sync
+WorkingDirectory=/opt/uc-remote-sync
+Environment=NODE_ENV=production
+Environment=UC_CONFIG_HOME=/var/lib/uc-remote-sync/config
+Environment=STATE_DIRECTORY=/var/lib/uc-remote-sync/data
+Environment=UC_INTEGRATION_HTTP_PORT=11082
+Environment=DEBUG=ucapi:info,ucapi:warn,ucapi:error,remote-sync:*
+ExecStart=/usr/bin/node /opt/uc-remote-sync/src/driver.js
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/uc-remote-sync
+
+[Install]
+WantedBy=multi-user.target

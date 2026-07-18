@@ -1,0 +1,23 @@
+services:
+  remote-sync:
+    image: ${REMOTE_SYNC_IMAGE:-ghcr.io/jstnjx/uc-remote-sync:latest}
+    container_name: uc-remote-sync
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      DEBUG: "ucapi:info,ucapi:warn,ucapi:error,remote-sync:*"
+      UC_CONFIG_HOME: /config
+      STATE_DIRECTORY: /data
+      UC_INTEGRATION_HTTP_PORT: "11082"
+      UC_MDNS_HOSTNAME: "${UC_MDNS_HOSTNAME:-remote-sync}"
+      # Set UC_MDNS_ADDRESS to the Docker host LAN IP if it has multiple interfaces.
+      UC_MDNS_ADDRESS: "${UC_MDNS_ADDRESS:-}"
+    volumes:
+      - ./config:/config
+      - ./data:/data
+    healthcheck:
+      test: ["CMD", "node", "tools/healthcheck.js"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

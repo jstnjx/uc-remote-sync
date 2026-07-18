@@ -1,0 +1,18 @@
+{
+  "name": "uc-remote-sync",
+  "version": "0.5.3",
+  "description": "Proxy-mirror a master Unfolded Circle remote and its Dock 3 to child remotes without duplicating source integrations",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "start": "node src/driver.js",
+    "test": "node --test",
+    "check": "node tools/check-source.js",
+    "build:embedded": "node tools/build-embedded.js",
+    "package": "npm run check && npm test && npm run build:embedded"
+  },
+  "license": "MIT"
+}
