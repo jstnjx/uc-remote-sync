@@ -39,6 +39,36 @@ test("configuration migration creates backups before writing schema 6", () => {
   assert.ok(fs.readdirSync(directory).some((name) => name.includes("schema-4-to-6") && name.endsWith(".bak")));
 });
 
+test("directed broadcast IPv4 addresses are accepted", () => {
+  const config = validateConfig(validConfig({
+    remote: {
+      host: "10.1.1.102",
+      api_key: "api-key-123",
+      scheme: "http",
+      broadcasts: ["10.1.1.255"]
+    }
+  }));
+  assert.deepEqual(config.remote.broadcasts, ["10.1.1.255"]);
+});
+
+test("invalid broadcast values are rejected", () => {
+  assert.throws(
+    () => validateConfig(validConfig({
+      remote: {
+        host: "10.1.1.102",
+        api_key: "api-key-123",
+        scheme: "http",
+        broadcasts: ["10.1.1.999"]
+      }
+    })),
+    (error) => {
+      assert.ok(error instanceof ConfigurationError);
+      assert.ok(error.errors.some((item) => item.includes("remote.broadcasts")));
+      return true;
+    }
+  );
+});
+
 test("invalid configuration reports every actionable field error", () => {
   assert.throws(
     () => validateConfig(validConfig({ node_id: "", agent_token: "short", remote: { host: "", api_key: "bad" } })),

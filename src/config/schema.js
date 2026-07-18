@@ -59,7 +59,7 @@ function broadcasts(value, field, errors) {
   const source = Array.isArray(value) ? value : text(value).split(",");
   const result = [...new Set(source.map(text).filter(Boolean))];
   for (const item of result) {
-    if (net.isIPv4(item) !== 1) errors.push(`${field} contains invalid IPv4 address ${item}`);
+    if (!net.isIPv4(item)) errors.push(`${field} contains invalid IPv4 address ${item}`);
   }
   return result;
 }

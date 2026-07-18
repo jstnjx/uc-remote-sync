@@ -57,7 +57,7 @@ test("child pairing endpoint validates token and changes ready state after claim
     assert.deepEqual(claimed, { master_id: "master-node", master_name: "Living room" });
 
     const health = await fetch(`http://127.0.0.1:${port}/healthz`);
-    assert.deepEqual(await health.json(), { status: "ok", version: "0.7.1" });
+    assert.deepEqual(await health.json(), { status: "ok", version: "0.7.2" });
 
     const capabilities = await fetch(`http://127.0.0.1:${port}/v1/capabilities`);
     const capabilityBody = await capabilities.json();
@@ -191,7 +191,7 @@ test("public health is minimal while detailed status requires authentication", a
   await server.start();
   try {
     const health = await (await fetch(`http://127.0.0.1:${port}/healthz`)).json();
-    assert.deepEqual(health, { status: "ok", version: "0.7.1" });
+    assert.deepEqual(health, { status: "ok", version: "0.7.2" });
 
     const capabilities = await (await fetch(`http://127.0.0.1:${port}/v1/capabilities`)).json();
     assert.equal(capabilities.node_id, "primary-node");

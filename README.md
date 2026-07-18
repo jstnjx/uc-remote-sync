@@ -27,8 +27,8 @@ npm run package
 Generated installation files:
 
 ```text
-remote-sync-0.7.1.tar.gz
-remote-sync-0.7.1.tar.gz.sha256
+remote-sync-0.7.2.tar.gz
+remote-sync-0.7.2.tar.gz.sha256
 ```
 
 Tests remain in the source repository but are not copied into the Remote installation archive.
@@ -36,7 +36,7 @@ Tests remain in the source repository but are not copied into the Remote install
 ## Install on Remote Two/3
 
 1. Open **Web Configurator → Integrations → Add new → Install custom**.
-2. Select `remote-sync-0.7.1.tar.gz`.
+2. Select `remote-sync-0.7.2.tar.gz`.
 3. Select **Update existing driver** when upgrading.
 4. Install or update Satellites before updating the Primary during rolling upgrades.
 
@@ -73,7 +73,7 @@ docker compose logs -f remote-sync
 Pin a release:
 
 ```bash
-REMOTE_SYNC_IMAGE=ghcr.io/jstnjx/uc-remote-sync:0.7.1 docker compose up -d
+REMOTE_SYNC_IMAGE=ghcr.io/jstnjx/uc-remote-sync:0.7.2 docker compose up -d
 ```
 
 Build locally:

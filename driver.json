@@ -1,6 +1,6 @@
 {
   "driver_id": "remote_sync",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "min_core_api": "0.17.0",
   "name": {
     "en": "Remote Sync"

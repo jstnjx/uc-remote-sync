@@ -1,7 +1,7 @@
 {
   "name": "uc-remote-sync",
-  "version": "0.7.1",
-  "description": "Mirror a primary Unfolded Circle remote and proxy its Dock 3 to satellite remotes without duplicating source integrations",
+  "version": "0.7.2",
+  "description": "Synchronize activities, profiles, pages, entities, states, and commands from a primary Unfolded Circle Remote to satellite remotes, with Dock 3 access through authenticated tunnels.",
   "type": "module",
   "private": true,
   "engines": {

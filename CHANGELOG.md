@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.7.2 - 2026-07-18
+
+- Fixed IPv4 broadcast validation incorrectly rejecting every address because `net.isIPv4()` was compared with the number `1` instead of treated as a boolean.
+- Added regression coverage for valid directed broadcast addresses and malformed IPv4 values.
+- Updated the integration description to cover full configuration, entity, state, command, and Dock synchronization.
+
 ## 0.7.1 - 2026-07-18
 
 - Reorganized the source tree into complete domain folders and left `src/driver.js` as the only root-level source file.
