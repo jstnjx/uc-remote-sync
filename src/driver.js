@@ -1,15 +1,19 @@
 #!/usr/bin/env node
 import net from "node:net";
-import * as uc from "./integration-api.js";
-import { ConfigStore } from "./config-store.js";
-import { DEFAULT_INTEGRATION_PORT } from "./constants.js";
-import { driverJsonPath } from "./paths.js";
-import { RemoteSyncService } from "./service.js";
-import { SetupFlow } from "./setup-flow.js";
-import { EntityManager } from "./entities.js";
-import { logger } from "./logger.js";
+import * as uc from "./integration/api.js";
+import { ConfigStore } from "./config/store.js";
+import { DEFAULT_INTEGRATION_PORT } from "./shared/constants.js";
+import { driverJsonPath } from "./shared/paths.js";
+import { RemoteSyncService } from "./service/index.js";
+import { SetupFlow } from "./setup/index.js";
+import { EntityManager } from "./integration/entities.js";
+import { logger } from "./shared/logger.js";
 
 const log = logger("driver");
+
+// -----------------------------------------------------------------------------
+// Driver lifecycle
+// -----------------------------------------------------------------------------
 
 async function assertPortAvailable(host, port) {
   await new Promise((resolve, reject) => {
@@ -51,6 +55,10 @@ export class Driver {
 
 const driver = new Driver();
 let stopping = false;
+// -----------------------------------------------------------------------------
+// Process lifecycle
+// -----------------------------------------------------------------------------
+
 async function shutdown(signal) {
   if (stopping) return;
   stopping = true;

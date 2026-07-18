@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.7.1 - 2026-07-18
+
+- Reorganized the source tree into complete domain folders and left `src/driver.js` as the only root-level source file.
+- Moved Core communication, agent transport, integration API, Dock proxying, pairing, protocol, proxy catalogue, network handling, storage, and shared infrastructure into dedicated modules.
+- Renamed domain implementation files to concise names such as `apply/index.js`, `apply/docks.js`, `apply/profiles.js`, `core/events.js`, `storage/mappings.js`, and `storage/operations.js`.
+- Updated every source, test, workflow, and documentation import to the new structure without adding compatibility wrapper files.
+- Added source-layout documentation to make ownership and navigation explicit.
+
+## 0.7.0 - 2026-07-18
+
+- Restored the automated test suite to the source repository while keeping all test files out of the Remote installation archive.
+- Added a dedicated reusable `test.yml` workflow and made release and GHCR publishing depend on successful tests.
+- Added strict configuration schema validation, explicit migration functions, pre-migration backups and a `configuration_invalid` runtime state with actionable errors.
+- Added protocol, snapshot-schema and capability negotiation for pairing, synchronization, previews, Dock tunnels and credential-management operations.
+- Added authenticated Satellite status and management APIs plus per-Satellite sensors and actions on the Primary.
+- Added read-only automatic network identity results and advanced fallback overrides to Primary and Satellite setup.
+- Split setup, synchronization transport, profile restoration and Dock restoration into dedicated modules.
+- Replaced the public detailed health response with a minimal `/healthz` endpoint and moved diagnostics to authenticated `/v1/status`.
+- Added synchronization previews with estimated create, update and remove counts globally and per Satellite.
+- Added credential rotation, rediscovery, enable/disable, unpair and remove operations for configured Satellites.
+- Expanded regression coverage to configuration migration, validation, protocol negotiation, network detection, health authorization, Satellite management and dry-run previews.
+
+## 0.6.1 - 2026-07-18
+
+- Removed Primary and Satellite MAC-address and WoWLAN-broadcast entry fields from setup.
+- Added automatic local Wi-Fi interface detection for on-device Primary and Satellite installations.
+- Added external Primary neighbor-table lookup to determine the target Remote MAC after contacting Core.
+- Calculate directed WoWLAN broadcast addresses from the selected LAN interface address and netmask.
+- Publish Satellite network identity through pairing mDNS records and the authenticated pairing API.
+- Populate discovered Satellite peer network details automatically and retain saved values only as a fallback.
+- Added environment overrides for routed or unusual multi-interface deployments.
+
+## 0.6.0 - 2026-07-18
+
+- Replaced the user-facing Master / Child terminology with Primary / Satellite while retaining the stored `master` and `child` role values for configuration compatibility.
+- Split primary setup into three steps: primary details, synchronization settings, and discovered satellite configuration.
+- Preserved entered values while moving between setup steps and when validation returns the user to an earlier step.
+- Replaced explanatory code-comment blocks with consistent section dividers across the source tree.
+- Reduced inferred media-player command-to-feature mappings to the explicitly retained command set.
+- Removed automated tests from the repository build workflow and made source validation independent of a `tests` directory.
+
 ## 0.5.3 - 2026-07-18
 
 - Changed the project license from MPL-2.0 to MIT.

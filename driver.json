@@ -1,13 +1,13 @@
 {
   "driver_id": "remote_sync",
-  "version": "0.5.3",
+  "version": "0.7.1",
   "min_core_api": "0.17.0",
   "name": {
     "en": "Remote Sync"
   },
   "icon": "custom:remote-sync.png",
   "description": {
-    "en": "Mirror a master Unfolded Circle remote and proxy its Dock 3 to child remotes through authenticated tunnels."
+    "en": "Mirror a primary Unfolded Circle remote and proxy its Dock 3 to satellite remotes through authenticated tunnels."
   },
   "port": 11082,
   "developer": {
@@ -28,7 +28,7 @@
         "field": {
           "label": {
             "value": {
-              "en": "Choose Master or Child. Child setup only requires the Web Configurator PIN; master setup discovers children that are ready to pair."
+              "en": "Choose Primary or Satellite. Satellite setup only requires the Web Configurator PIN; primary setup uses a guided three-step wizard, discovers satellites that are ready to pair, and detects WoWLAN network details automatically."
             }
           }
         }

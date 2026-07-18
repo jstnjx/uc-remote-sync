@@ -1,56 +1,68 @@
 # UC Remote Sync
 
-UC Remote Sync can run directly on an Unfolded Circle Remote Two/3 or externally as a Docker or Node.js service. External deployment is intended for the master instance; child instances must run directly on their remotes because the virtual Dock endpoint uses loopback networking.
+UC Remote Sync synchronizes one Primary Unfolded Circle Remote with one or more Satellite remotes. It can run directly on Remote Two/3 or as an external Primary through Docker or Node.js. Satellite instances must run directly on their remotes because the virtual Dock endpoint uses loopback networking.
 
 ## Requirements
 
-- Node.js 22.13 or newer for source builds and standalone deployment
+- Node.js 22.13 or newer for builds and standalone deployment
 - Docker with Compose for container deployment
-- An Unfolded Circle Remote Two/3 for direct installation
+- Remote Two or Remote 3 for direct installation
 
-## Build
+## Build and test
 
-Install no runtime dependencies; the project uses the Node.js standard library.
-
-Run validation and tests:
+The project has no runtime npm dependencies.
 
 ```bash
 npm run check
 npm test
-```
-
-Build the Remote installation archive:
-
-```bash
 npm run build:embedded
 ```
 
-Or run the complete validation and packaging pipeline:
+To validate and build without running tests:
 
 ```bash
 npm run package
 ```
 
-Generated files:
+Generated installation files:
 
 ```text
-remote-sync-<version>.tar.gz
-remote-sync-<version>.tar.gz.sha256
+remote-sync-0.7.1.tar.gz
+remote-sync-0.7.1.tar.gz.sha256
 ```
 
+Tests remain in the source repository but are not copied into the Remote installation archive.
 
 ## Install on Remote Two/3
 
-1. Download `remote-sync-<version>.tar.gz` from the GitHub release or build it locally.
-2. Open **Web Configurator → Integrations → Add new → Install custom**.
-3. Select the archive.
-4. For an existing installation, choose **Update existing driver**.
+1. Open **Web Configurator → Integrations → Add new → Install custom**.
+2. Select `remote-sync-0.7.1.tar.gz`.
+3. Select **Update existing driver** when upgrading.
+4. Install or update Satellites before updating the Primary during rolling upgrades.
 
-For rolling updates, update child remotes first and the master last. Existing configuration, pairing credentials and identifier mappings are retained.
+### Primary setup
+
+Primary setup uses three steps:
+
+1. Define the Primary details and optional advanced network overrides.
+2. Configure synchronization settings and sections.
+3. Pair and configure discovered Satellites.
+
+The setup displays the detected interface, IPv4 address, MAC address, directed WoWLAN broadcast address and detection source. Manual overrides are only required for unusual routed or multi-interface networks.
+
+### Satellite setup
+
+Satellite setup requires the Web Configurator PIN. Network identity is detected automatically and shown before the configuration is saved. Advanced MAC and broadcast overrides remain available.
 
 ## Deploy with Docker Compose
 
-The default Compose configuration pulls the multi-architecture GHCR image:
+The default Compose file pulls:
+
+```text
+ghcr.io/jstnjx/uc-remote-sync:latest
+```
+
+Start the external Primary:
 
 ```bash
 docker compose pull
@@ -58,42 +70,27 @@ docker compose up -d
 docker compose logs -f remote-sync
 ```
 
-Default image:
-
-```text
-ghcr.io/jstnjx/uc-remote-sync:latest
-```
-
-Pin a specific image tag:
+Pin a release:
 
 ```bash
-REMOTE_SYNC_IMAGE=ghcr.io/jstnjx/uc-remote-sync:0.5.3 docker compose up -d
+REMOTE_SYNC_IMAGE=ghcr.io/jstnjx/uc-remote-sync:0.7.1 docker compose up -d
 ```
 
-Build the image locally instead of pulling it:
+Build locally:
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 ```
 
-The container uses host networking for Unfolded Circle discovery, child pairing discovery and WoWLAN broadcasts. Persistent state is stored in:
+Host networking is required for Remote discovery, Satellite pairing and WoWLAN. Persistent configuration and state are stored in `./config` and `./data`.
 
-```text
-./config
-./data
-```
-
-On a host with multiple network interfaces, set the LAN address advertised to the remotes:
+On a multi-interface host, set the LAN address to advertise:
 
 ```bash
 UC_MDNS_ADDRESS=192.168.1.10 docker compose up -d
 ```
 
-The `ghcr.yml` workflow validates the source and publishes `linux/amd64` and `linux/arm64` images to `ghcr.io/<owner>/<repository>`.
-
 ## Deploy with Node.js
-
-Run the service directly:
 
 ```bash
 UC_CONFIG_HOME=/var/lib/uc-remote-sync/config \
@@ -102,29 +99,87 @@ UC_INTEGRATION_HTTP_PORT=11082 \
 node src/driver.js
 ```
 
-Available deployment variables:
+A systemd unit template is included at `deploy/remote-sync.service`.
+
+## Deployment variables
 
 | Variable | Default | Purpose |
 |---|---:|---|
-| `UC_CONFIG_HOME` | `config` | Persistent configuration directory |
-| `STATE_DIRECTORY` | `data` | Persistent state directory |
+| `UC_CONFIG_HOME` | `config` | Configuration directory |
+| `STATE_DIRECTORY` | `data` | Runtime-state directory |
 | `UC_INTEGRATION_HTTP_PORT` | `11082` | Integration API port |
 | `UC_INTEGRATION_INTERFACE` | `0.0.0.0` | Integration API bind address |
 | `UC_MDNS_HOSTNAME` | `remote-sync` | Advertised mDNS hostname |
 | `UC_MDNS_ADDRESS` | automatic | LAN address advertised through mDNS |
+| `REMOTE_SYNC_PRIMARY_MAC` | automatic | Advanced external Primary MAC override |
+| `REMOTE_SYNC_PRIMARY_BROADCASTS` | automatic | Advanced Primary broadcast override list |
+| `REMOTE_SYNC_SATELLITE_MAC` | automatic | Advanced Satellite MAC override |
+| `REMOTE_SYNC_SATELLITE_BROADCASTS` | automatic | Advanced Satellite broadcast override list |
+| `REMOTE_SYNC_SATELLITE_REMOTE_ADDRESS` | `127.0.0.1` | Advanced Satellite Core address override |
+| `REMOTE_SYNC_CHILD_REMOTE_ADDRESS` | unset | Deprecated alias for the Satellite address |
 | `UC_DISABLE_MDNS_PUBLISH` | `false` | Disable integration mDNS publication |
 | `DEBUG` | unset | Logging namespace filter |
 
-A systemd unit template is included at `deploy/remote-sync.service`.
+## Health and management
+
+Public container health endpoint:
+
+```text
+GET /healthz
+```
+
+It returns only service status and version. Detailed diagnostics require the agent bearer token:
+
+```text
+GET /v1/status
+GET /v1/satellites
+POST /v1/satellites/<peer-id>/actions/<action>
+```
+
+Supported Satellite actions are `sync`, `preview`, `enable`, `disable`, `rediscover`, `rotate`, `unpair` and `remove`. Equivalent management buttons and status sensors are exposed by the Primary integration.
+
+A synchronization preview can also be started through the global **Preview synchronization** button or with `POST /v1/sync` using `dry_run: true`. Preview mode estimates create, update and remove operations without applying the snapshot.
 
 ## Ports
 
 | Port | Service |
 |---:|---|
-| `11081` | Master/child agent and pairing API |
-| `11082` | Unfolded Circle integration API |
-| `11083` | Child-side virtual Dock WebSocket server |
+| `11081` | Agent, pairing, management and Dock tunnel API |
+| `11082` | Unfolded Circle Integration API |
+| `11083` | Satellite virtual Dock WebSocket server |
+
+## GitHub workflows
+
+- `test.yml` validates source and runs the complete test suite.
+- `build.yml` creates and validates the Remote installation archive without running tests.
+- `release.yml` requires tests and attaches the installation archive to tagged releases.
+- `ghcr.yml` requires tests and publishes `linux/amd64` and `linux/arm64` images.
 
 ## License
 
-This project is licensed under the MIT License. See [LICENSE](LICENSE).
+MIT
+
+## Source layout
+
+Only the executable entry point remains at the root of `src`:
+
+```text
+src/
+├── driver.js             # Process entry point and lifecycle
+├── agent/                # Satellite agent HTTP and WebSocket server
+├── apply/                # Snapshot application, profiles, Docks, and previews
+├── config/               # Configuration storage, migration, and validation
+├── core/                 # Remote Core REST and WebSocket clients
+├── dock/                 # Virtual Dock and physical Dock tunnel proxy
+├── integration/          # UC integration protocol server and exposed entities
+├── network/              # Network identity detection and WoWLAN
+├── pairing/              # Pairing records, identifiers, and mDNS discovery
+├── protocol/             # Compatibility descriptors and signed snapshots
+├── proxy/                # Proxy-entity catalogue generation and persistence
+├── service/              # Runtime orchestration and synchronization services
+├── setup/                # Primary and Satellite setup workflows
+├── shared/               # Constants, logging, paths, models, and utilities
+├── storage/              # Persistent mappings and operation cache
+└── transport/            # Generic WebSocket transport
+```
+

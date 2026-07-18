@@ -9,6 +9,6 @@ COPY src ./src
 COPY tools/healthcheck.js ./tools/healthcheck.js
 RUN mkdir -p /config /data
 VOLUME ["/config", "/data"]
-EXPOSE 11081 11082
+EXPOSE 11081 11082 11083
 HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=3 CMD ["node", "tools/healthcheck.js"]
 ENTRYPOINT ["node", "src/driver.js"]

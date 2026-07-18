@@ -4,6 +4,10 @@ import path from "node:path";
 import { gzipSync } from "node:zlib";
 import { fileURLToPath } from "node:url";
 
+// -----------------------------------------------------------------------------
+// Build metadata
+// -----------------------------------------------------------------------------
+
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const metadata = JSON.parse(fs.readFileSync(path.join(root, "driver.json"), "utf8"));
 const version = process.env.REMOTE_SYNC_VERSION || metadata.version;
@@ -19,6 +23,10 @@ fs.writeFileSync(path.join(packageDir, "bin", "package.json"), '{"type":"module"
 fs.chmodSync(path.join(packageDir, "bin", "driver.js"), 0o755);
 fs.copyFileSync(path.join(root, "driver.json"), path.join(packageDir, "driver.json"));
 fs.copyFileSync(path.join(root, "remote-sync.png"), path.join(packageDir, "remote-sync.png"));
+
+// -----------------------------------------------------------------------------
+// Tar archive writer
+// -----------------------------------------------------------------------------
 
 function octal(value, length) { return `${Math.max(0, value).toString(8).padStart(length - 1, "0")}\0`; }
 function header(name, size, mode, type) {
