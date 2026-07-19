@@ -9,10 +9,16 @@ import { dropdown, label } from "./forms.js";
 // -----------------------------------------------------------------------------
 
 export class SetupFlow {
-  constructor(store, onConfigured, { discovery = new RemoteSyncDiscovery({ timeoutMs: 3000 }) } = {}) {
+  constructor(store, onConfigured, {
+    discovery = new RemoteSyncDiscovery({ timeoutMs: 3000 }),
+    manualSatelliteInspector = undefined,
+    peerClientFactory = undefined
+  } = {}) {
     this.store = store;
     this.onConfigured = onConfigured;
     this.discovery = discovery;
+    this.manualSatelliteInspector = manualSatelliteInspector;
+    this.peerClientFactory = peerClientFactory;
     this.workflow = null;
     this.awaitingRole = true;
     this.loadError = null;
@@ -67,7 +73,11 @@ export class SetupFlow {
 
   async #activatePrimary(existing) {
     this.awaitingRole = false;
-    this.workflow = new PrimarySetup(this.store, this.onConfigured, existing, { discovery: this.discovery });
+    this.workflow = new PrimarySetup(this.store, this.onConfigured, existing, {
+      discovery: this.discovery,
+      manualSatelliteInspector: this.manualSatelliteInspector,
+      peerClientFactory: this.peerClientFactory
+    });
     return this.workflow.start();
   }
 

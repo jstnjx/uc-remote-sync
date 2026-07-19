@@ -1,6 +1,6 @@
 {
   "driver_id": "remote_sync",
-  "version": "0.7.3",
+  "version": "0.7.4",
   "min_core_api": "0.17.0",
   "name": {
     "en": "Remote Sync"
@@ -28,12 +28,12 @@
         "field": {
           "label": {
             "value": {
-              "en": "Choose Primary or Satellite. Satellite setup only requires the Web Configurator PIN; primary setup uses a guided three-step wizard, discovers satellites that are ready to pair."
+              "en": "Choose Primary or Satellite. Satellite setup only requires the Web Configurator PIN; Primary setup uses a guided three-step wizard with automatic discovery and a manual Satellite fallback when mDNS is unavailable."
             }
           }
         }
       }
     ]
   },
-  "release_date": "2026-07-18"
+  "release_date": "2026-07-19"
 }

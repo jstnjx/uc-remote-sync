@@ -27,8 +27,8 @@ npm run package
 Generated installation files:
 
 ```text
-remote-sync-0.7.3.tar.gz
-remote-sync-0.7.3.tar.gz.sha256
+remote-sync-0.7.4.tar.gz
+remote-sync-0.7.4.tar.gz.sha256
 ```
 
 Tests remain in the source repository but are not copied into the Remote installation archive.
@@ -36,7 +36,7 @@ Tests remain in the source repository but are not copied into the Remote install
 ## Install on Remote Two/3
 
 1. Open **Web Configurator → Integrations → Add new → Install custom**.
-2. Select `remote-sync-0.7.3.tar.gz`.
+2. Select `remote-sync-0.7.4.tar.gz`.
 3. Select **Update existing driver** when upgrading.
 4. Install or update Satellites before updating the Primary during rolling upgrades.
 
@@ -46,9 +46,9 @@ Primary setup uses three steps:
 
 1. Define the Primary details, optional Remote HTTP port and advanced network overrides.
 2. Configure synchronization settings and sections.
-3. Pair and configure discovered Satellites.
+3. Pair and configure discovered Satellites, or enter a Satellite agent address and pairing token manually when mDNS discovery is unavailable.
 
-The setup displays the detected interface, IPv4 address, MAC address, directed WoWLAN broadcast address and detection source. Manual overrides are only required for unusual routed or multi-interface networks.
+The setup displays the detected interface, IPv4 address, MAC address, directed WoWLAN broadcast address and detection source. If mDNS does not find a Satellite, enter its agent IP or hostname, optional agent port, and pairing token. The Primary retrieves the pairing identifier and network identity automatically. Multiple manual Satellites can be added before completing setup. Network overrides are only required for unusual routed or multi-interface networks.
 
 ### Satellite setup
 
@@ -73,7 +73,7 @@ docker compose logs -f remote-sync
 Pin a release:
 
 ```bash
-REMOTE_SYNC_IMAGE=ghcr.io/jstnjx/uc-remote-sync:0.7.3 docker compose up -d
+REMOTE_SYNC_IMAGE=ghcr.io/jstnjx/uc-remote-sync:0.7.4 docker compose up -d
 ```
 
 Build locally:

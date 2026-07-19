@@ -20,6 +20,7 @@ import {
   splitCsv
 } from "./common.js";
 import { dropdown, label, text } from "./forms.js";
+import { hasManualSatelliteInput, inspectManualSatellite } from "./manual-satellite.js";
 
 const log = logger("setup-primary");
 
@@ -30,14 +31,21 @@ const log = logger("setup-primary");
 const Step = Object.freeze({ Details: 1, Approval: 2, Settings: 3, Satellites: 4 });
 
 export class PrimarySetup {
-  constructor(store, onConfigured, existing = null, { discovery = new RemoteSyncDiscovery({ timeoutMs: 3000 }) } = {}) {
+  constructor(store, onConfigured, existing = null, {
+    discovery = new RemoteSyncDiscovery({ timeoutMs: 3000 }),
+    manualSatelliteInspector = inspectManualSatellite,
+    peerClientFactory = (baseUrl, token) => new PeerAgentClient(baseUrl, token)
+  } = {}) {
     this.store = store;
     this.onConfigured = onConfigured;
     this.existing = existing?.role === "master" ? existing : null;
     this.discovery = discovery;
+    this.manualSatelliteInspector = manualSatelliteInspector;
+    this.peerClientFactory = peerClientFactory;
     this.step = Step.Details;
     this.draft = { details: {}, settings: {}, satellites: {}, prepared: null };
     this.satellites = [];
+    this.manualNotice = null;
   }
 
   start() {
@@ -236,8 +244,9 @@ export class PrimarySetup {
     const value = (key, fallback = "") => Object.prototype.hasOwnProperty.call(values, key) ? values[key] : fallback;
     const settings = [];
     if (error) settings.push(label("error", "Setup error", error));
-    settings.push(label("satellites_header", "Satellite remotes", "Discovered and previously paired satellites are shown below. Network values are automatic unless an advanced override is supplied."));
-    if (!this.satellites.length) settings.push(label("no_satellites", "No satellites discovered", "The Primary can be completed without a Satellite. Reopen setup after configuring a Satellite."));
+    settings.push(label("satellites_header", "Satellite remotes", "Discovered, manually added, and previously paired Satellites are shown below. Network values are automatic unless an advanced override is supplied."));
+    if (this.manualNotice) settings.push(label("manual_satellite_notice", "Manual Satellite added", this.manualNotice));
+    if (!this.satellites.length) settings.push(label("no_satellites", "No Satellites discovered", "Enter the Satellite agent details manually below, or complete setup without a Satellite."));
     for (const satellite of this.satellites) {
       const key = satelliteKey(satellite.identifier);
       const status = satellite.ready ? "Ready to pair" : "Previously paired";
@@ -250,7 +259,7 @@ export class PrimarySetup {
         text(
           `satellite_token_${key}`,
           "Pairing token",
-          "",
+          value(`satellite_token_${key}`, satellite.manualToken || ""),
           satellite.existing ? "Leave empty to retain the saved token." : "Enter the token displayed by this Satellite."
         ),
         text(`satellite_name_${key}`, "Friendly name", value(`satellite_name_${key}`, satellite.existing?.name || satellite.name || satellite.identifier)),
@@ -261,16 +270,60 @@ export class PrimarySetup {
           interface: satellite.interface,
           source: satellite.network_source || satellite.discovery
         })),
-        text(`satellite_${key}_mac_override`, "Advanced Satellite MAC override", "", "Optional. Leave empty to keep automatic discovery."),
-        text(`satellite_${key}_broadcast_overrides`, "Advanced Satellite broadcast override(s)", "", "Optional comma-separated directed broadcast addresses.")
+        text(`satellite_${key}_mac_override`, "Advanced Satellite MAC override", value(`satellite_${key}_mac_override`, ""), "Optional. Leave empty to keep automatic discovery."),
+        text(`satellite_${key}_broadcast_overrides`, "Advanced Satellite broadcast override(s)", value(`satellite_${key}_broadcast_overrides`, ""), "Optional comma-separated directed broadcast addresses.")
       );
     }
+    settings.push(
+      label("manual_satellite_header", "Manual Satellite fallback", "Use this when mDNS does not discover a Satellite. The Primary retrieves the pairing identifier and network details automatically."),
+      text(
+        "manual_satellite_address",
+        "Satellite agent address",
+        value("manual_satellite_address", ""),
+        "Enter the Satellite Remote IP, hostname, or full agent URL."
+      ),
+      text(
+        "manual_satellite_agent_port",
+        "Satellite agent port",
+        value("manual_satellite_agent_port", ""),
+        `Optional. Leave empty to use a port included in the address or the default ${DEFAULT_AGENT_PORT}.`
+      ),
+      text(
+        "manual_satellite_token",
+        "Satellite pairing token",
+        value("manual_satellite_token", ""),
+        "Enter the pairing token displayed during Satellite setup."
+      ),
+      text(
+        "manual_satellite_name",
+        "Satellite friendly name",
+        value("manual_satellite_name", ""),
+        "Optional. The Satellite name is retrieved automatically when left empty."
+      ),
+      dropdown(
+        "satellite_setup_action",
+        "Setup action",
+        value("satellite_setup_action", "complete"),
+        [["complete", "Complete setup"], ["add_manual", "Add manual Satellite and continue configuring"]]
+      )
+    );
     return new uc.RequestUserInput({ en: "Step 3 of 3 — Configure satellite remotes" }, settings);
   }
 
   async #handleSatellites(values) {
-    this.draft.satellites = { ...values };
+    this.draft.satellites = { ...this.draft.satellites, ...values };
     try {
+      const action = String(this.draft.satellites.satellite_setup_action || "complete");
+      const hasManual = hasManualSatelliteInput(this.draft.satellites);
+      if (action === "add_manual" && !hasManual) throw new Error("Enter the manual Satellite address and pairing token before adding it.");
+      if (hasManual) {
+        const satellite = await this.#addManualSatellite(this.draft.satellites);
+        if (action === "add_manual") {
+          this.manualNotice = `${satellite.name} (${satellite.identifier}) was added using ${satellite.url}.`;
+          this.#clearManualSatelliteFields();
+          return this.#satellitesForm();
+        }
+      }
       const config = this.#buildConfig();
       await this.#pairReadySatellites(config);
       const saved = this.store.save(config);
@@ -280,6 +333,49 @@ export class PrimarySetup {
       log.warn("Primary setup failed:", error);
       return this.#satellitesForm(setupErrorMessage(error));
     }
+  }
+
+  async #addManualSatellite(values) {
+    const prepared = this.draft.prepared;
+    if (!prepared) throw new Error("Primary details have not been prepared.");
+    const primaryId = nodeId(prepared.version, prepared.address.host);
+    const primaryName = String(this.draft.details.node_name || "").trim() || prepared.version?.device_name || "Remote Sync Primary";
+    const requiredCapabilities = ["proxy_entities"];
+    const sections = DEFAULT_SECTIONS.filter((section) => this.draft.settings[`section_${section}`] !== "no");
+    if (sections.includes("docks")) requiredCapabilities.push("dock_tunnel");
+
+    const satellite = await this.manualSatelliteInspector({
+      address: values.manual_satellite_address,
+      port: values.manual_satellite_agent_port,
+      token: values.manual_satellite_token,
+      name: values.manual_satellite_name,
+      masterId: primaryId,
+      masterName: primaryName,
+      requiredCapabilities,
+      existingPeers: this.existing?.peers || []
+    });
+    const normalized = normalizePairingIdentifier(satellite.identifier);
+    const index = this.satellites.findIndex((item) => normalizePairingIdentifier(item.identifier) === normalized);
+    if (index >= 0) {
+      const current = this.satellites[index];
+      this.satellites[index] = { ...current, ...satellite, existing: satellite.existing || current.existing || null };
+    } else this.satellites.push(satellite);
+    this.satellites.sort((a, b) => String(a.name || a.identifier).localeCompare(String(b.name || b.identifier)));
+
+    const key = satelliteKey(satellite.identifier);
+    this.draft.satellites[`satellite_token_${key}`] = satellite.manualToken;
+    this.draft.satellites[`satellite_name_${key}`] = satellite.name;
+    return satellite;
+  }
+
+  #clearManualSatelliteFields() {
+    for (const key of [
+      "manual_satellite_address",
+      "manual_satellite_agent_port",
+      "manual_satellite_token",
+      "manual_satellite_name"
+    ]) this.draft.satellites[key] = "";
+    this.draft.satellites.satellite_setup_action = "complete";
   }
 
   #buildConfig() {
@@ -370,7 +466,7 @@ export class PrimarySetup {
     return this.satellites.map((satellite) => {
       const key = satelliteKey(satellite.identifier);
       const enteredToken = String(values[`satellite_token_${key}`] || "").trim();
-      const token = enteredToken || satellite.existing?.token || "";
+      const token = enteredToken || satellite.manualToken || satellite.existing?.token || "";
       if (satellite.ready && token.length < 16) throw new Error(`Enter the pairing token for ${satellite.name || satellite.identifier}.`);
       if (!token) throw new Error(`No saved pairing token exists for ${satellite.name || satellite.identifier}.`);
       const macOverrideRaw = String(values[`satellite_${key}_mac_override`] || "").trim();
@@ -381,7 +477,7 @@ export class PrimarySetup {
         peer_id: `rms-${normalizePairingIdentifier(satellite.identifier).toLowerCase()}`,
         identifier: displayPairingIdentifier(satellite.identifier),
         name: String(values[`satellite_name_${key}`] || "").trim() || satellite.name || satellite.identifier,
-        url: satellite.existing?.identifier ? null : (satellite.url || satellite.existing?.url || null),
+        url: satellite.url || satellite.existing?.url || null,
         token,
         mac: macOverride || satellite.mac || satellite.existing?.mac || null,
         broadcasts: broadcastOverrides.length ? broadcastOverrides : (satellite.broadcasts?.length ? satellite.broadcasts : (satellite.existing?.broadcasts || [])),
@@ -397,7 +493,7 @@ export class PrimarySetup {
   async #pairReadySatellites(config) {
     for (const satellite of this.satellites.filter((item) => item.ready)) {
       const peer = config.peers.find((item) => normalizePairingIdentifier(item.identifier) === normalizePairingIdentifier(satellite.identifier));
-      const client = new PeerAgentClient(satellite.url, peer.token);
+      const client = this.peerClientFactory(satellite.url, peer.token);
       const required = ["proxy_entities"];
       if (config.sync.sections.includes("docks")) required.push("dock_tunnel");
       const protocol = await client.capabilities({ requiredCapabilities: required });
