@@ -27,6 +27,7 @@ export class SatelliteSetup {
     this.step = Step.Pin;
     this.pending = null;
     this.detectedNetwork = null;
+    this.values = {};
   }
 
   async start() {
@@ -48,25 +49,32 @@ export class SatelliteSetup {
 
   #form(error = null) {
     const settings = [];
+    const value = (key, fallback = "") => Object.prototype.hasOwnProperty.call(this.values, key) ? this.values[key] : fallback;
     if (error) settings.push(label("error", "Setup error", error));
     settings.push(
       label("detected_network", "Detected satellite network identity", networkIdentityText(this.detectedNetwork)),
       text(
+        "remote_http_port",
+        "Satellite remote HTTP port",
+        value("remote_http_port", this.existing?.remote?.port ? String(this.existing.remote.port) : ""),
+        "Optional. Leave empty for the standard HTTP/HTTPS port or the port included in the configured Satellite address."
+      ),
+      text(
         "pin",
         "Web-configurator PIN",
-        "",
+        value("pin", ""),
         'Remote Sync creates a dedicated API key. Enable "Keep Wi-Fi connected during standby" before continuing.'
       ),
       text(
         "network_mac_override",
         "Advanced MAC override",
-        this.existing?.network_overrides?.mac || "",
+        value("network_mac_override", this.existing?.network_overrides?.mac || ""),
         "Optional. Leave empty to use automatic detection."
       ),
       text(
         "network_broadcast_overrides",
         "Advanced WoWLAN broadcast override(s)",
-        (this.existing?.network_overrides?.broadcasts || []).join(","),
+        value("network_broadcast_overrides", (this.existing?.network_overrides?.broadcasts || []).join(",")),
         "Optional comma-separated directed broadcast addresses."
       )
     );
@@ -74,6 +82,7 @@ export class SatelliteSetup {
   }
 
   async #handlePin(values) {
+    this.values = { ...values };
     const pin = String(values.pin || "").trim();
     if (!pin) return this.#form("Enter the satellite remote's web-configurator PIN.");
     try {
@@ -81,7 +90,8 @@ export class SatelliteSetup {
       const address = parseRemoteAddress(
         process.env.REMOTE_SYNC_SATELLITE_REMOTE_ADDRESS
         || process.env.REMOTE_SYNC_CHILD_REMOTE_ADDRESS
-        || "127.0.0.1"
+        || "127.0.0.1",
+        values.remote_http_port
       );
       const provisioned = await CoreClient.provisionApiKey(address.host, pin, {
         name: `Remote Sync Satellite ${crypto.randomBytes(5).toString("hex")}`,

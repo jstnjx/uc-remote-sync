@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import * as uc from "../src/integration/api.js";
 import { SetupFlow } from "../src/setup/index.js";
+import { parseRemoteAddress } from "../src/setup/common.js";
 
 class MemoryStore {
   constructor(value = null) { this.value = value; }
@@ -23,7 +24,7 @@ test("satellite setup shows detected network and advanced overrides after role s
   const roleForm = await flow.handler(new uc.DriverSetupRequest(false));
   assert.deepEqual(roleForm.settings.map((item) => item.id), ["role"]);
   const childForm = await flow.handler(new uc.UserDataResponse({ role: "child" }));
-  assert.deepEqual(childForm.settings.map((item) => item.id), ["detected_network", "pin", "network_mac_override", "network_broadcast_overrides"]);
+  assert.deepEqual(childForm.settings.map((item) => item.id), ["detected_network", "remote_http_port", "pin", "network_mac_override", "network_broadcast_overrides"]);
 });
 
 test("primary setup starts with the dedicated details step", async () => {
@@ -35,10 +36,22 @@ test("primary setup starts with the dedicated details step", async () => {
   assert.deepEqual(ids, [
     "node_name",
     "remote_address",
+    "remote_http_port",
     "pin",
     "agent_public_url",
     "physical_dock_tokens",
     "network_mac_override",
     "network_broadcast_overrides"
   ]);
+});
+
+
+test("remote setup port overrides an embedded or default HTTP port", () => {
+  assert.deepEqual(parseRemoteAddress("10.1.1.170", "8080"), { scheme: "http", host: "10.1.1.170", port: 8080 });
+  assert.deepEqual(parseRemoteAddress("https://10.1.1.170:8443", ""), { scheme: "https", host: "10.1.1.170", port: 8443 });
+});
+
+test("remote setup rejects invalid HTTP ports", () => {
+  assert.throws(() => parseRemoteAddress("10.1.1.170", "70000"), /between 1 and 65535/);
+  assert.throws(() => parseRemoteAddress("10.1.1.170", "abc"), /between 1 and 65535/);
 });

@@ -27,8 +27,8 @@ npm run package
 Generated installation files:
 
 ```text
-remote-sync-0.7.2.tar.gz
-remote-sync-0.7.2.tar.gz.sha256
+remote-sync-0.7.3.tar.gz
+remote-sync-0.7.3.tar.gz.sha256
 ```
 
 Tests remain in the source repository but are not copied into the Remote installation archive.
@@ -36,7 +36,7 @@ Tests remain in the source repository but are not copied into the Remote install
 ## Install on Remote Two/3
 
 1. Open **Web Configurator → Integrations → Add new → Install custom**.
-2. Select `remote-sync-0.7.2.tar.gz`.
+2. Select `remote-sync-0.7.3.tar.gz`.
 3. Select **Update existing driver** when upgrading.
 4. Install or update Satellites before updating the Primary during rolling upgrades.
 
@@ -44,7 +44,7 @@ Tests remain in the source repository but are not copied into the Remote install
 
 Primary setup uses three steps:
 
-1. Define the Primary details and optional advanced network overrides.
+1. Define the Primary details, optional Remote HTTP port and advanced network overrides.
 2. Configure synchronization settings and sections.
 3. Pair and configure discovered Satellites.
 
@@ -52,7 +52,7 @@ The setup displays the detected interface, IPv4 address, MAC address, directed W
 
 ### Satellite setup
 
-Satellite setup requires the Web Configurator PIN. Network identity is detected automatically and shown before the configuration is saved. Advanced MAC and broadcast overrides remain available.
+Satellite setup requires the Web Configurator PIN and allows an optional local Remote HTTP port to be specified. Network identity is detected automatically and shown before the configuration is saved. Advanced MAC and broadcast overrides remain available.
 
 ## Deploy with Docker Compose
 
@@ -73,7 +73,7 @@ docker compose logs -f remote-sync
 Pin a release:
 
 ```bash
-REMOTE_SYNC_IMAGE=ghcr.io/jstnjx/uc-remote-sync:0.7.2 docker compose up -d
+REMOTE_SYNC_IMAGE=ghcr.io/jstnjx/uc-remote-sync:0.7.3 docker compose up -d
 ```
 
 Build locally:
@@ -157,6 +157,29 @@ A synchronization preview can also be started through the global **Preview synch
 
 ## License
 
-MIT License. See [LICENSE](LICENSE).
+MIT
 
+## Source layout
+
+Only the executable entry point remains at the root of `src`:
+
+```text
+src/
+├── driver.js             # Process entry point and lifecycle
+├── agent/                # Satellite agent HTTP and WebSocket server
+├── apply/                # Snapshot application, profiles, Docks, and previews
+├── config/               # Configuration storage, migration, and validation
+├── core/                 # Remote Core REST and WebSocket clients
+├── dock/                 # Virtual Dock and physical Dock tunnel proxy
+├── integration/          # UC integration protocol server and exposed entities
+├── network/              # Network identity detection and WoWLAN
+├── pairing/              # Pairing records, identifiers, and mDNS discovery
+├── protocol/             # Compatibility descriptors and signed snapshots
+├── proxy/                # Proxy-entity catalogue generation and persistence
+├── service/              # Runtime orchestration and synchronization services
+├── setup/                # Primary and Satellite setup workflows
+├── shared/               # Constants, logging, paths, models, and utilities
+├── storage/              # Persistent mappings and operation cache
+└── transport/            # Generic WebSocket transport
+```
 

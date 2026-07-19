@@ -82,6 +82,12 @@ export class PrimarySetup {
         "Use 127.0.0.1 when installed on the primary remote. Enter the remote IP when running externally."
       ),
       text(
+        "remote_http_port",
+        "Primary remote HTTP port",
+        value("remote_http_port", this.existing?.remote?.port ? String(this.existing.remote.port) : ""),
+        "Optional. Leave empty for the standard HTTP/HTTPS port or the port included in the remote address."
+      ),
+      text(
         "pin",
         "Web-configurator PIN",
         "",
@@ -115,7 +121,7 @@ export class PrimarySetup {
   async #handleDetails(values) {
     this.draft.details = { ...values };
     try {
-      const address = parseRemoteAddress(values.remote_address || "");
+      const address = parseRemoteAddress(values.remote_address || "", values.remote_http_port);
       const pin = String(values.pin || "").trim();
       if (!pin && !this.existing?.remote?.api_key) return this.#detailsForm("Enter the primary remote's web-configurator PIN.");
       const overrides = networkOverrides(values);

@@ -8,11 +8,18 @@ import { normalizePairingIdentifier } from "../pairing/mdns.js";
 // Setup parsing and validation
 // -----------------------------------------------------------------------------
 
-export function parseRemoteAddress(value) {
+export function parseRemoteAddress(value, explicitPort = null) {
   const normalized = String(value || "").includes("://") ? String(value).trim() : `http://${String(value).trim()}`;
   const parsed = new URL(normalized);
   if (!parsed.hostname || !["http:", "https:"].includes(parsed.protocol)) throw new Error("Invalid remote address.");
-  return { scheme: parsed.protocol.slice(0, -1), host: parsed.hostname, port: parsed.port ? Number(parsed.port) : null };
+
+  const rawPort = String(explicitPort ?? "").trim();
+  const selectedPort = rawPort ? Number(rawPort) : (parsed.port ? Number(parsed.port) : null);
+  if (selectedPort !== null && (!Number.isInteger(selectedPort) || selectedPort < 1 || selectedPort > 65535)) {
+    throw new Error("Remote HTTP port must be an integer between 1 and 65535.");
+  }
+
+  return { scheme: parsed.protocol.slice(0, -1), host: parsed.hostname, port: selectedPort };
 }
 
 export function nodeId(version, host) {
