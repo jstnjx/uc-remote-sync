@@ -157,29 +157,6 @@ A synchronization preview can also be started through the global **Preview synch
 
 ## License
 
-MIT
+MIT License. See [LICENSE](LICENSE).
 
-## Source layout
-
-Only the executable entry point remains at the root of `src`:
-
-```text
-src/
-├── driver.js             # Process entry point and lifecycle
-├── agent/                # Satellite agent HTTP and WebSocket server
-├── apply/                # Snapshot application, profiles, Docks, and previews
-├── config/               # Configuration storage, migration, and validation
-├── core/                 # Remote Core REST and WebSocket clients
-├── dock/                 # Virtual Dock and physical Dock tunnel proxy
-├── integration/          # UC integration protocol server and exposed entities
-├── network/              # Network identity detection and WoWLAN
-├── pairing/              # Pairing records, identifiers, and mDNS discovery
-├── protocol/             # Compatibility descriptors and signed snapshots
-├── proxy/                # Proxy-entity catalogue generation and persistence
-├── service/              # Runtime orchestration and synchronization services
-├── setup/                # Primary and Satellite setup workflows
-├── shared/               # Constants, logging, paths, models, and utilities
-├── storage/              # Persistent mappings and operation cache
-└── transport/            # Generic WebSocket transport
-```
 
