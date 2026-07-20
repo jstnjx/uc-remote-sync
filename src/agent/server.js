@@ -267,7 +267,11 @@ export class AgentServer {
           jsonResponse(response, 400, { error: "source_activity_id and state are required" });
           return;
         }
-        const result = await this.activityStateCallback({ source_activity_id: sourceActivityId, state });
+        const update = { source_activity_id: sourceActivityId, state };
+        if (body.source_epoch) update.source_epoch = body.source_epoch;
+        if (body.revision !== undefined && body.revision !== null) update.revision = body.revision;
+        if (body.observed_at) update.observed_at = body.observed_at;
+        const result = await this.activityStateCallback(update);
         jsonResponse(response, result.success ? 200 : (result.status || 422), result);
         return;
       }

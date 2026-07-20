@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import { logger } from "../shared/logger.js";
 
 const log = logger("activity-sync");
@@ -14,12 +15,17 @@ export class ActivitySyncManager {
     this.resolvePeerUrl = resolvePeerUrl;
     this.forwardProxyCommand = forwardProxyCommand;
     this.relaySuppressions = new Map();
-    this.commandIntents = new Map();
+    this.sourceEpoch = crypto.randomUUID();
+    this.stateRevisions = new Map();
+    this.appliedStateVersions = new Map();
+    this.applyQueues = new Map();
   }
 
   clear() {
     this.relaySuppressions.clear();
-    this.commandIntents.clear();
+    this.stateRevisions.clear();
+    this.appliedStateVersions.clear();
+    this.applyQueues.clear();
   }
 
   #actionFromState(state) {
@@ -27,6 +33,42 @@ export class ActivitySyncManager {
     if (value === "ON") return "on";
     if (value === "OFF") return "off";
     return null;
+  }
+
+  #stateMatchesAction(state, action) {
+    const value = String(state || "").trim().toUpperCase();
+    if (action === "on") return ["ON", "STARTING"].includes(value);
+    if (action === "off") return ["OFF", "STOPPING"].includes(value);
+    return false;
+  }
+
+  #nextRevision(sourceActivityId) {
+    const revision = Number(this.stateRevisions.get(sourceActivityId) || 0) + 1;
+    this.stateRevisions.set(sourceActivityId, revision);
+    return revision;
+  }
+
+  #stateUpdate(sourceActivityId, state) {
+    return {
+      source_activity_id: sourceActivityId,
+      state: String(state),
+      source_epoch: this.sourceEpoch,
+      revision: this.#nextRevision(sourceActivityId),
+      observed_at: new Date().toISOString()
+    };
+  }
+
+  #isStaleVersion(sourceActivityId, sourceEpoch, revision) {
+    const value = Number(revision);
+    if (!sourceEpoch || !Number.isSafeInteger(value) || value < 1) return false;
+    const current = this.appliedStateVersions.get(sourceActivityId);
+    return current?.source_epoch === sourceEpoch && Number(current.revision) >= value;
+  }
+
+  #recordVersion(sourceActivityId, sourceEpoch, revision) {
+    const value = Number(revision);
+    if (!sourceEpoch || !Number.isSafeInteger(value) || value < 1) return;
+    this.appliedStateVersions.set(sourceActivityId, { source_epoch: sourceEpoch, revision: value });
   }
 
   async #push(peer, event) {
@@ -76,7 +118,7 @@ export class ActivitySyncManager {
       state = detail.attributes?.state ?? detail.state ?? state;
     }
     if (entityType !== "activity" || !this.#actionFromState(state)) return;
-    const update = { source_activity_id: sourceActivityId, state: String(state) };
+    const update = this.#stateUpdate(sourceActivityId, state);
     const peers = config.peers.filter((peer) => peer.enabled);
     await Promise.allSettled(peers.map(async (peer) => {
       try {
@@ -93,14 +135,30 @@ export class ActivitySyncManager {
       const state = record?.detail?.attributes?.state ?? record?.detail?.state;
       if (!sourceActivityId || typeof state !== "string" || !this.#actionFromState(state)) continue;
       try {
-        await this.#push(peer, { source_activity_id: sourceActivityId, state });
+        await this.#push(peer, this.#stateUpdate(sourceActivityId, state));
       } catch (error) {
         log.warn(`Could not initialize activity state ${sourceActivityId} on ${peer.name}: ${error.message}`);
       }
     }
   }
 
-  async apply({ source_activity_id, state }) {
+  async apply(update) {
+    const sourceActivityId = String(update?.source_activity_id || "").trim();
+    if (!sourceActivityId) return { success: false, status: 400, error: "Unsupported activity state" };
+
+    const previous = this.applyQueues.get(sourceActivityId) || Promise.resolve();
+    const current = previous
+      .catch(() => undefined)
+      .then(() => this.#applyStateUpdate({ ...update, source_activity_id: sourceActivityId }));
+    this.applyQueues.set(sourceActivityId, current);
+    try {
+      return await current;
+    } finally {
+      if (this.applyQueues.get(sourceActivityId) === current) this.applyQueues.delete(sourceActivityId);
+    }
+  }
+
+  async #applyStateUpdate({ source_activity_id, state, source_epoch = null, revision = null }) {
     const config = this.getConfig();
     const client = this.getClient();
     if (!config || config.role !== "child" || !client) return { success: false, status: 409, error: "This node is not an active satellite" };
@@ -111,20 +169,18 @@ export class ActivitySyncManager {
     const targetActivityId = sourceNode ? this.getMappings().get(sourceNode, "activity", sourceActivityId) : null;
     if (!targetActivityId) return { success: false, status: 404, error: `No satellite activity mapping exists for ${sourceActivityId}` };
 
-    const pendingIntent = this.commandIntents.get(sourceActivityId);
-    if (pendingIntent) {
-      if (Number(pendingIntent.expires_at || 0) <= Date.now()) this.commandIntents.delete(sourceActivityId);
-      else if (pendingIntent.action !== action) {
-        log.info(`Ignoring stale primary activity ${action.toUpperCase()} state for ${sourceActivityId}; satellite requested ${pendingIntent.action.toUpperCase()}`);
-        return { success: true, changed: false, ignored_stale: true, target_activity_id: targetActivityId, action };
-      } else this.commandIntents.delete(sourceActivityId);
+    if (this.#isStaleVersion(sourceActivityId, source_epoch, revision)) {
+      return { success: true, changed: false, ignored_stale: true, target_activity_id: targetActivityId, action };
     }
 
     try {
       const current = (await client.getJson(`/entities/${encodeURIComponent(targetActivityId)}`, { optionalStatuses: [404] }))
         || (await client.getJson(`/activities/${encodeURIComponent(targetActivityId)}`, { optionalStatuses: [404] }));
       const currentState = current?.attributes?.state ?? current?.state;
-      if (this.#actionFromState(currentState) === action) return { success: true, changed: false, target_activity_id: targetActivityId };
+      if (this.#stateMatchesAction(currentState, action)) {
+        this.#recordVersion(sourceActivityId, source_epoch, revision);
+        return { success: true, changed: false, target_activity_id: targetActivityId, action };
+      }
     } catch (error) {
       log.debug(`Could not read satellite activity state for ${targetActivityId}: ${error.message}`);
     }
@@ -133,6 +189,7 @@ export class ActivitySyncManager {
     this.relaySuppressions.set(suppressionKey, Date.now() + 10_000);
     try {
       await client.executeEntityCommand(targetActivityId, `activity.${action}`);
+      this.#recordVersion(sourceActivityId, source_epoch, revision);
       return { success: true, changed: true, target_activity_id: targetActivityId, action };
     } catch (error) {
       this.relaySuppressions.delete(suppressionKey);
@@ -151,10 +208,6 @@ export class ActivitySyncManager {
       return { success: true, suppressed: true, source_entity_id: source, cmd_id: `activity.${normalizedAction}` };
     }
     this.relaySuppressions.delete(key);
-    const intent = { action: normalizedAction, expires_at: Date.now() + 360_000 };
-    this.commandIntents.set(source, intent);
-    const result = await this.forwardProxyCommand(source, `activity.${normalizedAction}`);
-    if (!result.success && this.commandIntents.get(source) === intent) this.commandIntents.delete(source);
-    return result;
+    return this.forwardProxyCommand(source, `activity.${normalizedAction}`);
   }
 }

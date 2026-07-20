@@ -161,7 +161,7 @@ test("child applies master activity state with on/off commands and suppresses th
 });
 
 
-test("child activity intent ignores a stale opposite master state until matching confirmation", async () => {
+test("newer Primary activity state overrides an earlier Satellite relay", async () => {
   const service = new RemoteSyncService({ load: () => null, save: () => {} });
   service.config = {
     role: "child", node_id: "child", node_name: "Child", peers: [],
@@ -169,25 +169,41 @@ test("child activity intent ignores a stale opposite master state until matching
     sync: { use_standby_inhibitor: false, prune: false, verify_existing_resource_hashes: false }
   };
   service.mappings = { get: (sourceNode, kind, sourceId) => sourceNode === "master" && kind === "activity" && sourceId === "uc.main.activity.source" ? "uc.main.activity.child" : null };
+  let state = "ON";
   const commands = [];
   service.client = {
     async getJson(path) {
-      if (path === "/entities/uc.main.activity.child") return { entity_id: "uc.main.activity.child", entity_type: "activity", attributes: { state: "OFF" } };
+      if (path === "/entities/uc.main.activity.child") return { entity_id: "uc.main.activity.child", entity_type: "activity", attributes: { state } };
       return null;
     },
-    async executeEntityCommand(entityId, cmdId) { commands.push({ entityId, cmdId }); return {}; }
+    async executeEntityCommand(entityId, cmdId) {
+      commands.push({ entityId, cmdId });
+      state = cmdId.endsWith(".off") ? "OFF" : "ON";
+      return {};
+    }
   };
   service.forwardProxyCommand = async (sourceEntityId, cmdId) => ({ success: true, status: 200, source_entity_id: sourceEntityId, cmd_id: cmdId });
 
   const forwarded = await service.forwardActivityCommand("uc.main.activity.source", "on");
   assert.equal(forwarded.success, true);
 
-  const stale = await service.applyActivityState({ source_activity_id: "uc.main.activity.source", state: "OFF" });
-  assert.equal(stale.success, true);
-  assert.equal(stale.ignored_stale, true);
-  assert.deepEqual(commands, []);
+  const primaryOff = await service.applyActivityState({
+    source_activity_id: "uc.main.activity.source",
+    state: "OFF",
+    source_epoch: "primary-epoch",
+    revision: 2
+  });
+  assert.equal(primaryOff.success, true);
+  assert.equal(primaryOff.changed, true);
+  assert.deepEqual(commands, [{ entityId: "uc.main.activity.child", cmdId: "activity.off" }]);
 
-  const confirmed = await service.applyActivityState({ source_activity_id: "uc.main.activity.source", state: "ON" });
-  assert.equal(confirmed.success, true);
-  assert.deepEqual(commands, [{ entityId: "uc.main.activity.child", cmdId: "activity.on" }]);
+  const olderOn = await service.applyActivityState({
+    source_activity_id: "uc.main.activity.source",
+    state: "ON",
+    source_epoch: "primary-epoch",
+    revision: 1
+  });
+  assert.equal(olderOn.success, true);
+  assert.equal(olderOn.ignored_stale, true);
+  assert.deepEqual(commands, [{ entityId: "uc.main.activity.child", cmdId: "activity.off" }]);
 });
