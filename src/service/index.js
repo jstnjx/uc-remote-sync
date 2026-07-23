@@ -9,7 +9,7 @@ import { buildProxyCatalog, ProxyCatalogStore } from "../proxy/catalog.js";
 import { defaultPairingUrl, RemoteSyncDiscovery } from "../pairing/mdns.js";
 import { isTransportError, reachableAgentUrl, secureToken, sleep, utcNow } from "../shared/util.js";
 import { sendMagicPacket } from "../network/wol.js";
-import { WAKE_RETRY_SCHEDULE_MS, WAKE_TIMEOUT_MS } from "../shared/constants.js";
+import { MIN_EVENT_SYNC_INTERVAL_MS, WAKE_RETRY_SCHEDULE_MS, WAKE_TIMEOUT_MS } from "../shared/constants.js";
 import { logger } from "../shared/logger.js";
 import { bridgeMasterDockTunnel, physicalDockConnection, virtualDockToken, VirtualDockServer } from "../dock/proxy.js";
 import { ConfigurationError } from "../config/store.js";
@@ -34,6 +34,10 @@ export class RemoteSyncService {
     this.watcher = null;
     this.periodicTimer = null;
     this.initialSyncTimer = null;
+    this.eventSyncTimer = null;
+    this.lastSyncCompletedAt = 0;
+    this.trailingSyncRequested = false;
+    this.configurationRevision = 0;
     this.syncing = false;
     this.applying = false;
     this.listeners = [];
@@ -153,6 +157,8 @@ export class RemoteSyncService {
   async stop() {
     clearTimeout(this.periodicTimer); this.periodicTimer = null;
     clearTimeout(this.initialSyncTimer); this.initialSyncTimer = null;
+    clearTimeout(this.eventSyncTimer); this.eventSyncTimer = null;
+    this.trailingSyncRequested = false;
     this.watcher?.stop(); this.watcher = null;
     for (const close of this.dockTunnelSessions) close();
     this.dockTunnelSessions.clear();
@@ -182,7 +188,7 @@ export class RemoteSyncService {
     clearTimeout(this.periodicTimer);
     if (!this.config || this.config.role !== "master" || !this.config.sync.auto_sync) return;
     this.periodicTimer = setTimeout(async () => {
-      try { await this.syncNow(false); } catch (error) { log.error("Periodic synchronization failed:", error); }
+      try { await this.syncNow(false, { reconcile: true }); } catch (error) { log.error("Periodic synchronization failed:", error); }
       this.#schedulePeriodic();
     }, this.config.sync.interval_seconds * 1000);
     this.periodicTimer.unref?.();
@@ -191,9 +197,26 @@ export class RemoteSyncService {
   async #configurationEvents(events) {
     if (!this.config || this.config.role !== "master" || !this.config.sync.auto_sync) return;
     log.debug("Configuration event batch:", [...events].sort());
+    this.configurationRevision += 1;
     this.status.pending_changes = true;
     this.#notify();
-    await this.syncNow(false);
+    this.#scheduleEventSync();
+  }
+
+  #scheduleEventSync() {
+    clearTimeout(this.eventSyncTimer);
+    if (!this.config || this.config.role !== "master" || !this.config.sync.auto_sync || !this.status.pending_changes) return;
+    const cooldownRemaining = Math.max(0, this.lastSyncCompletedAt + MIN_EVENT_SYNC_INTERVAL_MS - Date.now());
+    const delay = cooldownRemaining;
+    this.eventSyncTimer = setTimeout(async () => {
+      this.eventSyncTimer = null;
+      if (this.syncing) {
+        this.trailingSyncRequested = true;
+        return;
+      }
+      try { await this.syncNow(false); } catch (error) { log.error("Event synchronization failed:", error); }
+    }, delay);
+    this.eventSyncTimer.unref?.();
   }
 
   applyActivityState(update) {
@@ -208,18 +231,23 @@ export class RemoteSyncService {
   // Snapshot synchronization
   // -------------------------------------------------------------------------
 
-  async syncNow(force = true, { dryRun = false, peerId = null } = {}) {
+  async syncNow(force = true, { dryRun = false, peerId = null, reconcile = false } = {}) {
     if (!this.config || !this.client) return { success: false, error: "Remote Sync is not configured" };
     if (this.config.role !== "master") return { success: false, error: "This node is configured as a satellite" };
-    if (this.syncing) return { success: false, error: "A synchronization is already running" };
+    if (!dryRun && !force && !reconcile && !this.status.pending_changes) return { success: true, changed: false, content_hash: this.status.last_snapshot_hash };
+    if (this.syncing) {
+      if (!dryRun) this.trailingSyncRequested = this.trailingSyncRequested || this.status.pending_changes;
+      return { success: false, error: "A synchronization is already running" };
+    }
     this.syncing = true;
+    const syncRevision = this.configurationRevision;
     this.status.state = dryRun ? "building synchronization preview" : "building snapshot";
     this.status.last_sync_result = dryRun ? "Collecting primary configuration for preview" : "Collecting primary configuration";
     this.#notify();
     try {
       const snapshot = await this.syncCoordinator.buildSnapshot();
       if (!dryRun && !force && snapshot.manifest.content_hash === this.status.last_snapshot_hash) {
-        Object.assign(this.status, { pending_changes: false, state: "connected", last_sync_result: "No configuration changes" });
+        Object.assign(this.status, { pending_changes: this.configurationRevision !== syncRevision, state: "connected", last_sync_result: "No configuration changes" });
         this.#notify();
         return { success: true, changed: false, content_hash: snapshot.manifest.content_hash };
       }
@@ -283,7 +311,7 @@ export class RemoteSyncService {
       }
       if (success) {
         this.status.last_snapshot_hash = snapshot.manifest.content_hash;
-        this.status.pending_changes = false;
+        this.status.pending_changes = this.configurationRevision !== syncRevision;
         this.status.successful_syncs += 1;
         this.status.state = "connected";
       } else {
@@ -303,6 +331,11 @@ export class RemoteSyncService {
       return { success: false, dry_run: dryRun, error: error.message, details: error.details || undefined };
     } finally {
       this.syncing = false;
+      if (!dryRun) this.lastSyncCompletedAt = Date.now();
+      if (!dryRun && (this.trailingSyncRequested || this.status.pending_changes)) {
+        this.trailingSyncRequested = false;
+        this.#scheduleEventSync();
+      }
     }
   }
 

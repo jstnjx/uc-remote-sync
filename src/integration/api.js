@@ -88,6 +88,15 @@ class EntityStore {
   updateEntityAttributes(id, attributes) {
     const entity = this.entities.get(id);
     if (!entity) return false;
+    const changed = Object.entries(attributes).some(([key, value]) => {
+      const current = entity.attributes[key];
+      if (Object.is(current, value)) return false;
+      if (current && value && typeof current === "object" && typeof value === "object") {
+        try { return JSON.stringify(current) !== JSON.stringify(value); } catch { return true; }
+      }
+      return true;
+    });
+    if (!changed) return false;
     Object.assign(entity.attributes, attributes);
     this.onUpdate?.(entity, attributes);
     return true;

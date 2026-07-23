@@ -1,10 +1,13 @@
 import crypto from "node:crypto";
-import { gzipSync, gunzipSync } from "node:zlib";
+import { gzip, gunzip } from "node:zlib";
+import { promisify } from "node:util";
 import { MAX_SNAPSHOT_BYTES, PROTOCOL_VERSION, SNAPSHOT_SCHEMA_VERSION } from "../shared/constants.js";
 import { canonicalJson, firstIdentifier, sha256Bytes, utcNow } from "../shared/util.js";
 import { logger } from "../shared/logger.js";
 
 const log = logger("snapshot");
+const gzipAsync = promisify(gzip);
+const gunzipAsync = promisify(gunzip);
 
 // -----------------------------------------------------------------------------
 // Entity metadata
@@ -86,9 +89,12 @@ export class SnapshotBuilder {
       warnings: [...this.warnings]
     };
     const encodedResources = {};
-    for (const [archivePath, resourcePayload] of payloads) encodedResources[archivePath] = resourcePayload.toString("base64");
+    for (const [archivePath, resourcePayload] of payloads) {
+      encodedResources[archivePath] = resourcePayload.toString("base64");
+      payloads.delete(archivePath);
+    }
     const envelope = { format: "uc-remote-sync-gzip-json-v1", manifest, resources: encodedResources };
-    const payload = gzipSync(Buffer.from(JSON.stringify(envelope)), { level: 6 });
+    const payload = await gzipAsync(Buffer.from(JSON.stringify(envelope)), { level: 3 });
     if (payload.length > MAX_SNAPSHOT_BYTES) throw new Error(`Snapshot exceeds ${MAX_SNAPSHOT_BYTES} bytes`);
     return { manifest, payload };
   }
@@ -397,7 +403,7 @@ export class SnapshotReader {
     if (payload.length > MAX_SNAPSHOT_BYTES) throw new Error("Snapshot exceeds maximum size");
     let envelope;
     try {
-      const uncompressed = gunzipSync(payload, { maxOutputLength: MAX_SNAPSHOT_BYTES * 3 });
+      const uncompressed = await gunzipAsync(payload, { maxOutputLength: MAX_SNAPSHOT_BYTES * 3 });
       envelope = JSON.parse(uncompressed.toString("utf8"));
     } catch (error) {
       throw new Error(`Invalid snapshot archive: ${error.message}`);

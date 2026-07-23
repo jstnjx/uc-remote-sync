@@ -171,7 +171,7 @@ export function normalizeAndValidateConfig(input) {
   }
 
   const interval = Number(sync.interval_seconds || DEFAULT_SYNC_INTERVAL_SECONDS);
-  if (!Number.isFinite(interval) || interval < 30 || interval > 86_400) errors.push("sync.interval_seconds must be between 30 and 86400");
+  if (!Number.isFinite(interval) || interval < 3600 || interval > 86_400) errors.push("sync.interval_seconds must be between 3600 and 86400");
 
   const networkOverrides = data.network_overrides && typeof data.network_overrides === "object" ? data.network_overrides : {};
   const result = {
@@ -216,7 +216,7 @@ export function normalizeAndValidateConfig(input) {
     peers: Array.isArray(data.peers) ? data.peers.map((item, index) => normalizePeer(item, index, errors)) : [],
     sync: {
       sections,
-      interval_seconds: Math.max(30, Math.min(86_400, Number.isFinite(interval) ? interval : DEFAULT_SYNC_INTERVAL_SECONDS)),
+      interval_seconds: Math.max(3600, Math.min(86_400, Number.isFinite(interval) ? interval : DEFAULT_SYNC_INTERVAL_SECONDS)),
       auto_sync: sync.auto_sync !== false,
       prune: sync.prune === true,
       use_standby_inhibitor: sync.use_standby_inhibitor !== false,

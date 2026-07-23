@@ -6,7 +6,7 @@ export const APP_NAME = "Remote Sync";
 export const DRIVER_ID = "remote_sync";
 export const ACTIVITY_RELAY_LOCAL_ID = "activity_relay";
 export const ACTIVITY_RELAY_ENTITY_ID = `${DRIVER_ID}.main.${ACTIVITY_RELAY_LOCAL_ID}`;
-export const APP_VERSION = "0.7.5";
+export const APP_VERSION = "0.7.6";
 export const SCHEMA_VERSION = 6;
 export const SNAPSHOT_SCHEMA_VERSION = 6;
 export const AGENT_API_VERSION = 1;
@@ -20,11 +20,12 @@ export const MIN_PROTOCOL_VERSION = 1;
 export const DEFAULT_AGENT_PORT = 11081;
 export const DEFAULT_INTEGRATION_PORT = 11082;
 export const DEFAULT_VIRTUAL_DOCK_PORT = 11083;
-export const DEFAULT_SYNC_INTERVAL_SECONDS = 300;
-export const DEFAULT_EVENT_DEBOUNCE_MS = 2000;
+export const DEFAULT_SYNC_INTERVAL_SECONDS = 3600;
+export const DEFAULT_EVENT_DEBOUNCE_MS = 20_000;
+export const MIN_EVENT_SYNC_INTERVAL_MS = 60_000;
 export const DEFAULT_OPERATION_TTL_MS = 15 * 60 * 1000;
 export const DEFAULT_OPERATION_CACHE_SIZE = 1024;
-export const MAX_SNAPSHOT_BYTES = 100 * 1024 * 1024;
+export const MAX_SNAPSHOT_BYTES = 32 * 1024 * 1024;
 export const REQUEST_TIMEOUT_MS = 5000;
 export const WAKE_TIMEOUT_MS = 90_000;
 export const WAKE_RETRY_SCHEDULE_MS = [500, 500, 1000, 1000, 2000, 2000, 5000];
@@ -45,5 +46,5 @@ export const BAD_INTEGRATION_STATES = new Set([
 ]);
 export const CONFIG_EVENT_NAMES = new Set([
   "integration_change", "integration_driver_change", "entity_change", "activity_group_change",
-  "profile_change", "active_profile_change", "dock_change", "dock_state"
+  "profile_change", "dock_change"
 ]);

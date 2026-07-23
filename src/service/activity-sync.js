@@ -19,6 +19,8 @@ export class ActivitySyncManager {
     this.stateRevisions = new Map();
     this.appliedStateVersions = new Map();
     this.applyQueues = new Map();
+    this.lastObservedStates = new Map();
+    this.lastPushedStates = new Map();
   }
 
   clear() {
@@ -26,6 +28,8 @@ export class ActivitySyncManager {
     this.stateRevisions.clear();
     this.appliedStateVersions.clear();
     this.applyQueues.clear();
+    this.lastObservedStates.clear();
+    this.lastPushedStates.clear();
   }
 
   #actionFromState(state) {
@@ -72,6 +76,9 @@ export class ActivitySyncManager {
   }
 
   async #push(peer, event) {
+    const dedupeKey = `${peer.peer_id}|${event.source_activity_id}`;
+    const stateKey = String(event.state || "").trim().toUpperCase();
+    if (this.lastPushedStates.get(dedupeKey) === stateKey) return false;
     const destination = await this.resolvePeerUrl(peer, false);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 10_000);
@@ -86,6 +93,7 @@ export class ActivitySyncManager {
         const text = await response.text();
         throw new Error(`HTTP ${response.status}${text ? `: ${text}` : ""}`);
       }
+      this.lastPushedStates.set(dedupeKey, stateKey);
       return true;
     } finally {
       clearTimeout(timer);
@@ -118,15 +126,18 @@ export class ActivitySyncManager {
       state = detail.attributes?.state ?? detail.state ?? state;
     }
     if (entityType !== "activity" || !this.#actionFromState(state)) return;
+    const normalizedState = String(state).trim().toUpperCase();
+    if (this.lastObservedStates.get(sourceActivityId) === normalizedState) return;
+    this.lastObservedStates.set(sourceActivityId, normalizedState);
     const update = this.#stateUpdate(sourceActivityId, state);
     const peers = config.peers.filter((peer) => peer.enabled);
-    await Promise.allSettled(peers.map(async (peer) => {
+    for (const peer of peers) {
       try {
         await this.#push(peer, update);
       } catch (error) {
         log.warn(`Could not synchronize activity state ${sourceActivityId} to ${peer.name}: ${error.message}`);
       }
-    }));
+    }
   }
 
   async initialize(peer, activities) {
