@@ -92,11 +92,12 @@ export class CoreWebSocket {
 // -----------------------------------------------------------------------------
 
 export class CoreEventWatcher {
-  constructor(endpoint, callback, { debounceMs = DEFAULT_EVENT_DEBOUNCE_MS, activityStateCallback = null } = {}) {
+  constructor(endpoint, callback, { debounceMs = DEFAULT_EVENT_DEBOUNCE_MS, activityStateCallback = null, reconnectCallback = null } = {}) {
     this.endpoint = endpoint;
     this.callback = callback;
     this.activityStateCallback = activityStateCallback;
     this.debounceMs = debounceMs;
+    this.reconnectCallback = reconnectCallback;
     this.stopped = false;
     this.pending = new Set();
     this.timer = null;
@@ -111,7 +112,9 @@ export class CoreEventWatcher {
         this.client = new CoreWebSocket(this.endpoint, { onEvent: (message) => this.#event(message) });
         await this.client.connect();
         await this.client.subscribeAll();
+        const reconnected = attempt > 0;
         attempt = 0;
+        if (reconnected) await this.reconnectCallback?.();
         await new Promise((resolve) => this.client.socket.once("close", resolve));
       } catch (error) {
         if (!this.stopped) log.warn("Core event stream disconnected:", error.message);
@@ -131,7 +134,9 @@ export class CoreEventWatcher {
     }
     if (!this.#configurationEvent(name, data)) return;
     this.pending.add(name);
-    if (!this.timer) this.timer = setTimeout(() => this.#flush(), this.debounceMs);
+    clearTimeout(this.timer);
+    this.timer = setTimeout(() => this.#flush(), this.debounceMs);
+    this.timer.unref?.();
   }
   #activityStateEvent(name, data) {
     if (name !== "entity_change" || !data || typeof data !== "object") return null;

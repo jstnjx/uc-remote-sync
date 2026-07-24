@@ -26,23 +26,30 @@ export class SyncCoordinator {
     this.discovery = discovery;
     this.setDockCatalog = setDockCatalog;
     this.initializeActivityStates = initializeActivityStates;
+    this.cache = null;
   }
 
-  async buildSnapshot() {
+  invalidateCache() { this.cache = null; }
+
+  cachedSnapshot() { return this.cache; }
+
+  async buildSnapshot({ force = false, shouldAbort = null } = {}) {
+    if (!force && this.cache) return this.cache;
     const config = this.getConfig();
     const client = this.getClient();
     log.info("Building configuration snapshot");
-    const snapshot = await new SnapshotBuilder(client, config).build();
+    const snapshot = await new SnapshotBuilder(client, config, { shouldAbort }).build();
     const docks = new Map((snapshot.manifest.data.docks || [])
       .map((record) => [String(record?.source_id || record?.detail?.dock_id || record?.detail?.id || ""), record?.detail || {}])
       .filter(([dockId]) => dockId));
     this.setDockCatalog(docks);
     log.info(`Snapshot ${snapshot.manifest.operation_id} built (${snapshot.payload.length} bytes, hash ${snapshot.manifest.content_hash.slice(0, 12)})`);
+    this.cache = snapshot;
     return snapshot;
   }
 
   async syncSinglePeer(peer, force = true) {
-    const snapshot = await this.buildSnapshot();
+    const snapshot = await this.buildSnapshot({ force });
     if (!force && snapshot.manifest.content_hash === this.getStatus().last_snapshot_hash) {
       return { success: true, changed: false };
     }

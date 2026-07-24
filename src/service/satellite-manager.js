@@ -1,6 +1,9 @@
 import crypto from "node:crypto";
 import { PeerAgentClient } from "./peer-agent-client.js";
-import { secureToken, utcNow } from "../shared/util.js";
+import fs from "node:fs";
+import path from "node:path";
+import { dataHome } from "../shared/paths.js";
+import { atomicWriteJson, readJson, secureToken, utcNow } from "../shared/util.js";
 
 // -----------------------------------------------------------------------------
 // Satellite runtime management
@@ -16,7 +19,8 @@ function runtimeDefaults() {
     mirrored_entities: 0,
     dock_tunnels: 0,
     last_sync_at: null,
-    last_sync_result: null
+    last_sync_result: null,
+    last_applied_hash: null, last_attempted_hash: null, consecutive_failures: 0, next_retry_at: null
   };
 }
 
@@ -28,12 +32,17 @@ export class SatelliteManager {
     this.syncPeer = syncPeer;
     this.previewPeer = previewPeer;
     this.notify = notify;
-    this.runtime = new Map();
+    this.runtimeFile = path.join(dataHome(), "peer-runtime.json");
+    this.runtime = new Map(Object.entries(readJson(this.runtimeFile, {})));
+    this.persistTimer = null;
   }
 
   record(peerId, values = {}) {
     const current = this.runtime.get(peerId) || runtimeDefaults();
-    this.runtime.set(peerId, { ...current, ...values });
+    const next = { ...current, ...values };
+    if (JSON.stringify(current) === JSON.stringify(next)) return;
+    this.runtime.set(peerId, next);
+    clearTimeout(this.persistTimer); this.persistTimer = setTimeout(() => { atomicWriteJson(this.runtimeFile, Object.fromEntries(this.runtime)); }, 250); this.persistTimer.unref?.();
     this.notify?.();
   }
 
@@ -57,16 +66,17 @@ export class SatelliteManager {
   async refresh(peerId = null) {
     const config = this.getConfig();
     const peers = (config?.peers || []).filter((peer) => !peerId || peer.peer_id === peerId);
-    await Promise.all(peers.map(async (peer) => {
+    let configChanged = false;
+    for (let start = 0; start < peers.length; start += 2) await Promise.all(peers.slice(start, start + 2).map(async (peer) => {
       try {
         const destination = await this.resolvePeer(peer, true);
         const client = new PeerAgentClient(destination.url, peer.token);
         const protocol = await client.capabilities();
         const status = await client.status();
-        peer.protocol = protocol;
+        if (JSON.stringify(peer.protocol) !== JSON.stringify(protocol)) { peer.protocol = protocol; configChanged = true; }
         const remoteConfig = status?.config?.remote || {};
-        if (remoteConfig.mac) peer.mac = String(remoteConfig.mac);
-        if (Array.isArray(remoteConfig.broadcasts) && remoteConfig.broadcasts.length) peer.broadcasts = remoteConfig.broadcasts.map(String);
+        if (remoteConfig.mac && peer.mac !== String(remoteConfig.mac)) { peer.mac = String(remoteConfig.mac); configChanged = true; }
+        if (Array.isArray(remoteConfig.broadcasts) && remoteConfig.broadcasts.length) { const nextBroadcasts = remoteConfig.broadcasts.map(String); if (JSON.stringify(peer.broadcasts || []) !== JSON.stringify(nextBroadcasts)) { peer.broadcasts = nextBroadcasts; configChanged = true; } }
         this.record(peer.peer_id, {
           online: true,
           version: protocol.version,
@@ -77,13 +87,14 @@ export class SatelliteManager {
           dock_tunnels: Number(status?.dock_tunnels || 0),
           last_sync_at: status?.status?.last_sync_at || null,
           last_sync_result: status?.status?.last_sync_result || null,
-          url: destination.url
+          url: destination.url,
+          last_applied_hash: status?.status?.last_snapshot_hash || null
         });
       } catch (error) {
         this.record(peer.peer_id, { online: false, last_error: error.message });
       }
     }));
-    if (config) this.store.save(config);
+    if (config && configChanged) this.store.save(config);
     return this.list();
   }
 

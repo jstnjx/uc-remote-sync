@@ -27,8 +27,8 @@ npm run package
 Generated installation files:
 
 ```text
-remote-sync-0.7.6.tar.gz
-remote-sync-0.7.6.tar.gz.sha256
+remote-sync-0.8.0.tar.gz
+remote-sync-0.8.0.tar.gz.sha256
 ```
 
 Tests remain in the source repository but are not copied into the Remote installation archive.
@@ -36,7 +36,7 @@ Tests remain in the source repository but are not copied into the Remote install
 ## Install on Remote Two/3
 
 1. Open **Web Configurator → Integrations → Add new → Install custom**.
-2. Select `remote-sync-0.7.6.tar.gz`.
+2. Select `remote-sync-0.8.0.tar.gz`.
 3. Select **Update existing driver** when upgrading.
 4. Install or update Satellites before updating the Primary during rolling upgrades.
 
@@ -73,7 +73,7 @@ docker compose logs -f remote-sync
 Pin a release:
 
 ```bash
-REMOTE_SYNC_IMAGE=ghcr.io/jstnjx/uc-remote-sync:0.7.6 docker compose up -d
+REMOTE_SYNC_IMAGE=ghcr.io/jstnjx/uc-remote-sync:0.8.0 docker compose up -d
 ```
 
 Build locally:
@@ -157,29 +157,4 @@ A synchronization preview can also be started through the global **Preview synch
 
 ## License
 
-MIT
-
-## Source layout
-
-Only the executable entry point remains at the root of `src`:
-
-```text
-src/
-├── driver.js             # Process entry point and lifecycle
-├── agent/                # Satellite agent HTTP and WebSocket server
-├── apply/                # Snapshot application, profiles, Docks, and previews
-├── config/               # Configuration storage, migration, and validation
-├── core/                 # Remote Core REST and WebSocket clients
-├── dock/                 # Virtual Dock and physical Dock tunnel proxy
-├── integration/          # UC integration protocol server and exposed entities
-├── network/              # Network identity detection and WoWLAN
-├── pairing/              # Pairing records, identifiers, and mDNS discovery
-├── protocol/             # Compatibility descriptors and signed snapshots
-├── proxy/                # Proxy-entity catalogue generation and persistence
-├── service/              # Runtime orchestration and synchronization services
-├── setup/                # Primary and Satellite setup workflows
-├── shared/               # Constants, logging, paths, models, and utilities
-├── storage/              # Persistent mappings and operation cache
-└── transport/            # Generic WebSocket transport
-```
-
+This project is licensed under the MIT License. See [LICENSE](LICENSE).

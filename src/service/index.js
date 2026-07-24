@@ -1,3 +1,4 @@
+import { monitorEventLoopDelay } from "node:perf_hooks";
 import { AgentServer } from "../agent/server.js";
 import { SnapshotApplier } from "../apply/index.js";
 import { CoreClient } from "../core/client.js";
@@ -9,7 +10,7 @@ import { buildProxyCatalog, ProxyCatalogStore } from "../proxy/catalog.js";
 import { defaultPairingUrl, RemoteSyncDiscovery } from "../pairing/mdns.js";
 import { isTransportError, reachableAgentUrl, secureToken, sleep, utcNow } from "../shared/util.js";
 import { sendMagicPacket } from "../network/wol.js";
-import { MIN_EVENT_SYNC_INTERVAL_MS, WAKE_RETRY_SCHEDULE_MS, WAKE_TIMEOUT_MS } from "../shared/constants.js";
+import { FULL_AUDIT_INTERVAL_MS, MAX_AUTO_SYNC_RSS_BYTES, MAX_EVENT_LOOP_DELAY_MS, MIN_EVENT_SYNC_INTERVAL_MS, PEER_RETRY_BACKOFF_MS, PERIODIC_JITTER_RATIO, WAKE_RETRY_SCHEDULE_MS, WAKE_TIMEOUT_MS } from "../shared/constants.js";
 import { logger } from "../shared/logger.js";
 import { bridgeMasterDockTunnel, physicalDockConnection, virtualDockToken, VirtualDockServer } from "../dock/proxy.js";
 import { ConfigurationError } from "../config/store.js";
@@ -32,6 +33,10 @@ export class RemoteSyncService {
     this.status = createStatus();
     this.agent = null;
     this.watcher = null;
+    this.watcherTask = null;
+    this.retryTimers = new Map();
+    this.lastFullAuditAt = 0;
+    this.eventLoopDelay = monitorEventLoopDelay({ resolution: 20 }); this.eventLoopDelay.enable();
     this.periodicTimer = null;
     this.initialSyncTimer = null;
     this.eventSyncTimer = null;
@@ -143,9 +148,10 @@ export class RemoteSyncService {
     } catch (error) { this.status.state = `unreachable: ${error.message}`; }
     if (config.role === "master") {
       this.watcher = new CoreEventWatcher(config.remote, (events) => this.#configurationEvents(events), {
-        activityStateCallback: (event) => this.activitySync.broadcast(event)
+        activityStateCallback: (event) => this.activitySync.broadcast(event),
+        reconnectCallback: async () => { this.status.pending_changes = true; this.configurationRevision += 1; this.syncCoordinator.invalidateCache(); this.#scheduleEventSync(); }
       });
-      this.watcher.run().catch((error) => log.error("Event watcher stopped:", error));
+      this.watcherTask = this.watcher.run().catch((error) => log.error("Event watcher stopped:", error));
       if (config.sync.auto_sync) {
         this.#scheduleInitialSync();
         this.#schedulePeriodic();
@@ -159,7 +165,9 @@ export class RemoteSyncService {
     clearTimeout(this.initialSyncTimer); this.initialSyncTimer = null;
     clearTimeout(this.eventSyncTimer); this.eventSyncTimer = null;
     this.trailingSyncRequested = false;
-    this.watcher?.stop(); this.watcher = null;
+    this.watcher?.stop();
+    await this.watcherTask; this.watcherTask = null; this.watcher = null;
+    for (const timer of this.retryTimers.values()) clearTimeout(timer); this.retryTimers.clear();
     for (const close of this.dockTunnelSessions) close();
     this.dockTunnelSessions.clear();
     await this.agent?.stop(); this.agent = null;
@@ -180,17 +188,26 @@ export class RemoteSyncService {
       this.initialSyncTimer = null;
       log.info("Starting initial synchronization after primary configuration");
       await this.syncNow(true);
-    }, 1500);
+    }, 2000 + Math.floor(Math.random() * 8000));
     this.initialSyncTimer.unref?.();
   }
 
   #schedulePeriodic() {
     clearTimeout(this.periodicTimer);
     if (!this.config || this.config.role !== "master" || !this.config.sync.auto_sync) return;
+    const base = this.config.sync.interval_seconds * 1000;
+    const jitter = Math.round(base * PERIODIC_JITTER_RATIO * (Math.random() * 2 - 1));
     this.periodicTimer = setTimeout(async () => {
-      try { await this.syncNow(false, { reconcile: true }); } catch (error) { log.error("Periodic synchronization failed:", error); }
+      try {
+        const peers = await this.satelliteManager.refresh();
+        const stale = peers.filter((peer) => peer.enabled && peer.last_applied_hash !== this.status.last_snapshot_hash);
+        for (const peer of stale) this.#schedulePeerRetry(peer.peer_id, true);
+        if (!this.lastFullAuditAt || Date.now() - this.lastFullAuditAt >= FULL_AUDIT_INTERVAL_MS) {
+          this.lastFullAuditAt = Date.now(); await this.syncNow(false, { reconcile: true, reason: "daily audit" });
+        }
+      } catch (error) { log.error("Periodic reconciliation failed:", error); }
       this.#schedulePeriodic();
-    }, this.config.sync.interval_seconds * 1000);
+    }, Math.max(60_000, base + jitter));
     this.periodicTimer.unref?.();
   }
 
@@ -198,6 +215,7 @@ export class RemoteSyncService {
     if (!this.config || this.config.role !== "master" || !this.config.sync.auto_sync) return;
     log.debug("Configuration event batch:", [...events].sort());
     this.configurationRevision += 1;
+    this.syncCoordinator.invalidateCache();
     this.status.pending_changes = true;
     this.#notify();
     this.#scheduleEventSync();
@@ -219,6 +237,33 @@ export class RemoteSyncService {
     this.eventSyncTimer.unref?.();
   }
 
+
+  #schedulePeerRetry(peerId, immediate = false) {
+    if (this.retryTimers.has(peerId) || !this.config?.sync?.auto_sync) return;
+    const runtime = this.satelliteManager.runtime.get(peerId) || {};
+    const failures = Number(runtime.consecutive_failures || 0);
+    const base = immediate ? 1000 : PEER_RETRY_BACKOFF_MS[Math.min(failures, PEER_RETRY_BACKOFF_MS.length - 1)];
+    const delay = Math.max(1000, Math.round(base * (0.9 + Math.random() * 0.2)));
+    const nextRetryAt = new Date(Date.now() + delay).toISOString();
+    this.satelliteManager.record(peerId, { next_retry_at: nextRetryAt });
+    const timer = setTimeout(async () => {
+      this.retryTimers.delete(peerId);
+      const peer = this.config?.peers?.find((item) => item.peer_id === peerId && item.enabled); if (!peer) return;
+      this.status.telemetry.retries += 1;
+      const snapshot = this.syncCoordinator.cachedSnapshot();
+      if (!snapshot) { this.status.pending_changes = true; this.#scheduleEventSync(); return; }
+      const result = await this.syncCoordinator.pushSnapshot(peer, snapshot.payload);
+      if (result.success) { this.satelliteManager.record(peerId, { online: true, last_error: null, last_applied_hash: snapshot.manifest.content_hash, last_attempted_hash: snapshot.manifest.content_hash, consecutive_failures: 0, next_retry_at: null, last_seen_at: utcNow() }); }
+      else { const nextFailures = failures + 1; this.satelliteManager.record(peerId, { online: false, last_error: result.error || result.report?.error || "Synchronization failed", last_attempted_hash: snapshot.manifest.content_hash, consecutive_failures: nextFailures }); this.#schedulePeerRetry(peerId); }
+    }, delay); timer.unref?.(); this.retryTimers.set(peerId, timer);
+  }
+
+  #automaticLoadAllowed() {
+    const memory = process.memoryUsage(); const eventLoopMs = Number(this.eventLoopDelay.mean || 0) / 1e6;
+    Object.assign(this.status.telemetry, { rss_bytes: memory.rss, heap_used_bytes: memory.heapUsed, event_loop_delay_ms: Math.round(eventLoopMs) });
+    return memory.rss < MAX_AUTO_SYNC_RSS_BYTES && eventLoopMs < MAX_EVENT_LOOP_DELAY_MS;
+  }
+
   applyActivityState(update) {
     return this.activitySync.apply(update);
   }
@@ -231,10 +276,11 @@ export class RemoteSyncService {
   // Snapshot synchronization
   // -------------------------------------------------------------------------
 
-  async syncNow(force = true, { dryRun = false, peerId = null, reconcile = false } = {}) {
+  async syncNow(force = true, { dryRun = false, peerId = null, reconcile = false, reason = null } = {}) {
     if (!this.config || !this.client) return { success: false, error: "Remote Sync is not configured" };
     if (this.config.role !== "master") return { success: false, error: "This node is configured as a satellite" };
-    if (!dryRun && !force && !reconcile && !this.status.pending_changes) return { success: true, changed: false, content_hash: this.status.last_snapshot_hash };
+    if (!dryRun && !force && !reconcile && !this.status.pending_changes) { this.status.telemetry.suppressed_builds += 1; return { success: true, changed: false, content_hash: this.status.last_snapshot_hash }; }
+    if (!dryRun && !force && !this.#automaticLoadAllowed()) { this.status.last_sync_result = "Automatic synchronization deferred due to process load"; this.#scheduleEventSync(); return { success: false, deferred: true, error: this.status.last_sync_result }; }
     if (this.syncing) {
       if (!dryRun) this.trailingSyncRequested = this.trailingSyncRequested || this.status.pending_changes;
       return { success: false, error: "A synchronization is already running" };
@@ -245,7 +291,9 @@ export class RemoteSyncService {
     this.status.last_sync_result = dryRun ? "Collecting primary configuration for preview" : "Collecting primary configuration";
     this.#notify();
     try {
-      const snapshot = await this.syncCoordinator.buildSnapshot();
+      this.status.telemetry.last_build_reason = reason || (dryRun ? "preview" : force ? "forced" : reconcile ? "audit" : "configuration event");
+      const snapshot = await this.syncCoordinator.buildSnapshot({ force: force || reconcile || dryRun, shouldAbort: () => !force && !dryRun && this.configurationRevision !== syncRevision });
+      this.status.telemetry.builds += 1; Object.assign(this.status.telemetry, { last_build_ms: snapshot.metrics?.build_ms || null, last_compression_ms: snapshot.metrics?.compression_ms || null, last_payload_bytes: snapshot.metrics?.payload_bytes || snapshot.payload.length, last_uncompressed_bytes: snapshot.metrics?.uncompressed_bytes || null, last_resource_count: snapshot.metrics?.resource_count || 0 });
       if (!dryRun && !force && snapshot.manifest.content_hash === this.status.last_snapshot_hash) {
         Object.assign(this.status, { pending_changes: this.configurationRevision !== syncRevision, state: "connected", last_sync_result: "No configuration changes" });
         this.#notify();
@@ -270,9 +318,14 @@ export class RemoteSyncService {
           last_error: result.success ? null : (result.error || result.report?.error || `HTTP ${result.status || "error"}`),
           last_sync_at: dryRun ? null : utcNow(),
           last_sync_result: dryRun ? result.preview?.summary || null : (result.success ? "Synchronized" : result.error || "Synchronization failed"),
-          mirrored_entities: Number(result.report?.counts?.proxy_entities_configured || result.report?.counts?.proxy_entities_updated || 0)
+          mirrored_entities: Number(result.report?.counts?.proxy_entities_configured || result.report?.counts?.proxy_entities_updated || 0),
+          last_attempted_hash: snapshot.manifest.content_hash,
+          last_applied_hash: result.success ? snapshot.manifest.content_hash : undefined,
+          consecutive_failures: result.success ? 0 : Number((this.satelliteManager.runtime.get(peer.peer_id) || {}).consecutive_failures || 0) + 1,
+          next_retry_at: result.success ? null : undefined
         });
         if (!dryRun && result.success) await this.activitySync.initialize(peer, snapshot.manifest.data.activities || []);
+        if (!dryRun && !result.success) this.#schedulePeerRetry(peer.peer_id);
       }
 
       const now = utcNow();
@@ -322,6 +375,7 @@ export class RemoteSyncService {
       this.#notify();
       return { success, changed: true, operation_id: snapshot.manifest.operation_id, content_hash: snapshot.manifest.content_hash, peers: peerResults, warnings: snapshot.manifest.warnings };
     } catch (error) {
+      if (error?.code === "SNAPSHOT_SUPERSEDED") { this.status.pending_changes = true; this.status.last_sync_result = error.message; return { success: false, superseded: true, error: error.message }; }
       log.error(dryRun ? "Synchronization preview failed:" : "Synchronization failed:", error);
       if (!dryRun) this.status.failed_syncs += 1;
       this.status.state = "error";
@@ -332,7 +386,7 @@ export class RemoteSyncService {
     } finally {
       this.syncing = false;
       if (!dryRun) this.lastSyncCompletedAt = Date.now();
-      if (!dryRun && (this.trailingSyncRequested || this.status.pending_changes)) {
+      if (!dryRun && (this.trailingSyncRequested || this.configurationRevision !== syncRevision)) {
         this.trailingSyncRequested = false;
         this.#scheduleEventSync();
       }

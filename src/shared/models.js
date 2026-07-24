@@ -53,7 +53,8 @@ export function createStatus(state = "unconfigured") {
     peer_results: {},
     last_preview_at: null,
     last_preview_result: null,
-    configuration_errors: []
+    configuration_errors: [],
+    telemetry: { builds: 0, suppressed_builds: 0, retries: 0, last_build_reason: null, last_build_ms: null, last_compression_ms: null, last_payload_bytes: null, last_uncompressed_bytes: null, last_resource_count: 0, rss_bytes: 0, heap_used_bytes: 0, event_loop_delay_ms: 0 }
   };
 }
 

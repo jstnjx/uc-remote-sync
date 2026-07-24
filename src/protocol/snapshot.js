@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import { gzip, gunzip } from "node:zlib";
 import { promisify } from "node:util";
-import { MAX_SNAPSHOT_BYTES, PROTOCOL_VERSION, SNAPSHOT_SCHEMA_VERSION } from "../shared/constants.js";
+import { MAX_RESOURCE_BYTES, MAX_RESOURCE_COUNT, MAX_SNAPSHOT_BYTES, MAX_TOTAL_RESOURCE_BYTES, MAX_UNCOMPRESSED_SNAPSHOT_BYTES, PROTOCOL_VERSION, SNAPSHOT_ENTITY_CONCURRENCY, SNAPSHOT_SCHEMA_VERSION } from "../shared/constants.js";
 import { canonicalJson, firstIdentifier, sha256Bytes, utcNow } from "../shared/util.js";
 import { logger } from "../shared/logger.js";
 
@@ -47,29 +47,38 @@ function mergeAvailableMetadata(configured, available) {
 // -----------------------------------------------------------------------------
 
 export class SnapshotBuilder {
-  constructor(client, config) {
+  constructor(client, config, { shouldAbort = null } = {}) {
     this.client = client;
     this.config = config;
     this.warnings = [];
     this.configuredEntityDetails = null;
+    this.shouldAbort = shouldAbort;
+    this.metrics = {};
   }
 
+  #checkpoint() { if (this.shouldAbort?.()) throw Object.assign(new Error("Snapshot build superseded by newer configuration"), { code: "SNAPSHOT_SUPERSEDED" }); }
+
   async build() {
+    const buildStarted = performance.now();
     const sections = [...new Set(this.config.sync.sections)];
     const data = {};
     const resources = [];
     const payloads = new Map();
     const coreVersion = await this.client.version();
     log.info(`Collecting snapshot from Core API ${coreVersion?.api || "unknown"}`);
+    this.#checkpoint();
     data.integrations = await this.client.integrations();
     log.info(`Collected ${data.integrations.length} integration instance(s)`);
+    this.#checkpoint();
     if (sections.includes("entities")) { data.entities = await this.#collectEntities(); log.info(`Collected ${data.entities.length} configured entity/entities`); }
+    this.#checkpoint();
     if (sections.includes("activities")) { data.activities = await this.#collectInternal("activities", "activity"); log.info(`Collected ${data.activities.length} activity/activities`); }
     if (sections.includes("activity_groups")) { data.activity_groups = await this.#listOptional("/activity_groups"); log.info(`Collected ${data.activity_groups.length} activity group(s)`); }
     if (sections.includes("macros")) { data.macros = await this.#collectMacros(); log.info(`Collected ${data.macros.length} macro(s)`); }
     if (sections.includes("remotes")) { data.remotes = await this.#collectInternal("remotes", "remote"); log.info(`Collected ${data.remotes.length} remote entity/entities`); }
     if (sections.includes("profiles")) { data.profiles = await this.#collectProfiles(); log.info(`Collected ${data.profiles.items.length} profile(s)`); }
     if (sections.includes("docks")) { data.docks = await this.#collectDocks(); log.info(`Collected ${data.docks.length} dock(s)`); }
+    this.#checkpoint();
     if (sections.includes("resources")) { await this.#collectResources(resources, payloads); log.info(`Collected ${resources.length} resource file(s)`); }
     const requiredIntegrations = [...this.#requiredIntegrations(data.entities || [])].sort();
     const contentHash = sha256Bytes(canonicalJson({ data, resources, required_integrations: requiredIntegrations }));
@@ -88,27 +97,34 @@ export class SnapshotBuilder {
       resources,
       warnings: [...this.warnings]
     };
-    const encodedResources = {};
-    for (const [archivePath, resourcePayload] of payloads) {
-      encodedResources[archivePath] = resourcePayload.toString("base64");
-      payloads.delete(archivePath);
-    }
-    const envelope = { format: "uc-remote-sync-gzip-json-v1", manifest, resources: encodedResources };
-    const payload = await gzipAsync(Buffer.from(JSON.stringify(envelope)), { level: 3 });
+    this.#checkpoint();
+    if (resources.length > MAX_RESOURCE_COUNT) throw new Error(`Snapshot resource count exceeds ${MAX_RESOURCE_COUNT}`);
+    const totalResourceBytes = resources.reduce((sum, item) => sum + Number(item.size || 0), 0);
+    if (totalResourceBytes > MAX_TOTAL_RESOURCE_BYTES) throw new Error(`Snapshot resources exceed ${MAX_TOTAL_RESOURCE_BYTES} bytes`);
+    for (const item of resources) if (Number(item.size || 0) > MAX_RESOURCE_BYTES) throw new Error(`Resource ${item.archive_path} exceeds ${MAX_RESOURCE_BYTES} bytes`);
+    const manifestBytes = Buffer.from(JSON.stringify(manifest));
+    const header = Buffer.allocUnsafe(12);
+    header.write("UCRS3", 0, "ascii"); header.writeUInt8(0, 5); header.writeUInt16BE(0, 6); header.writeUInt32BE(manifestBytes.length, 8);
+    const parts = [header, manifestBytes];
+    for (const item of resources) { const value = payloads.get(item.archive_path); if (!value) throw new Error(`Missing resource payload ${item.archive_path}`); parts.push(value); payloads.delete(item.archive_path); }
+    const uncompressed = Buffer.concat(parts);
+    if (uncompressed.length > MAX_UNCOMPRESSED_SNAPSHOT_BYTES) throw new Error(`Uncompressed snapshot exceeds ${MAX_UNCOMPRESSED_SNAPSHOT_BYTES} bytes`);
+    const compressionStarted = performance.now();
+    const payload = await gzipAsync(uncompressed, { level: 3 });
     if (payload.length > MAX_SNAPSHOT_BYTES) throw new Error(`Snapshot exceeds ${MAX_SNAPSHOT_BYTES} bytes`);
-    return { manifest, payload };
+    this.metrics = { build_ms: Math.round(performance.now() - buildStarted), compression_ms: Math.round(performance.now() - compressionStarted), payload_bytes: payload.length, uncompressed_bytes: uncompressed.length, resource_count: resources.length };
+    return { manifest, payload, metrics: this.metrics };
   }
 
   async #configuredEntities() {
     if (Array.isArray(this.configuredEntityDetails)) return this.configuredEntityDetails;
     const overview = await this.client.listPaginated("/entities");
-    const result = [];
-    for (const item of overview) {
-      const id = firstIdentifier(item, "entity_id", "id");
-      if (!id || String(id).startsWith("remote_sync.main.")) continue;
-      const detail = await this.#getOptional(`/entities/${encodeURIComponent(id)}`);
-      result.push(detail && typeof detail === "object" ? { ...item, ...detail } : item);
-    }
+    const filtered = overview.filter((item) => { const id = firstIdentifier(item, "entity_id", "id"); return id && !String(id).startsWith("remote_sync.main."); });
+    const result = new Array(filtered.length); let cursor = 0;
+    const workers = Array.from({ length: Math.min(SNAPSHOT_ENTITY_CONCURRENCY, filtered.length) }, async () => {
+      while (cursor < filtered.length) { const index = cursor++; const item = filtered[index]; const id = firstIdentifier(item, "entity_id", "id"); this.#checkpoint(); const detail = await this.#getOptional(`/entities/${encodeURIComponent(id)}`); result[index] = detail && typeof detail === "object" ? { ...item, ...detail } : item; }
+    });
+    await Promise.all(workers);
     this.configuredEntityDetails = result;
     return result;
   }
@@ -401,30 +417,29 @@ export class SnapshotReader {
   static async read(payload) {
     if (!Buffer.isBuffer(payload)) payload = Buffer.from(payload);
     if (payload.length > MAX_SNAPSHOT_BYTES) throw new Error("Snapshot exceeds maximum size");
-    let envelope;
-    try {
-      const uncompressed = await gunzipAsync(payload, { maxOutputLength: MAX_SNAPSHOT_BYTES * 3 });
-      envelope = JSON.parse(uncompressed.toString("utf8"));
-    } catch (error) {
-      throw new Error(`Invalid snapshot archive: ${error.message}`);
+    let uncompressed;
+    try { uncompressed = await gunzipAsync(payload, { maxOutputLength: MAX_UNCOMPRESSED_SNAPSHOT_BYTES }); } catch (error) { throw new Error(`Invalid snapshot archive: ${error.message}`); }
+    if (uncompressed.subarray(0, 5).toString("ascii") === "UCRS3") {
+      const manifestLength = uncompressed.readUInt32BE(8);
+      if (manifestLength <= 0 || 12 + manifestLength > uncompressed.length) throw new Error("Invalid binary snapshot manifest length");
+      const manifest = JSON.parse(uncompressed.subarray(12, 12 + manifestLength).toString("utf8"));
+      const resources = {}; let offset = 12 + manifestLength; let total = 0;
+      if ((manifest.resources || []).length > MAX_RESOURCE_COUNT) throw new Error("Snapshot resource count exceeds limit");
+      for (const item of manifest.resources || []) {
+        const archivePath = String(item.archive_path || ""); const size = Number(item.size || 0);
+        if (!archivePath || archivePath.includes("..") || archivePath.startsWith("/") || archivePath.includes("\\")) throw new Error(`Unsafe resource archive path: ${archivePath}`);
+        if (size > MAX_RESOURCE_BYTES || offset + size > uncompressed.length) throw new Error(`Resource size invalid: ${archivePath}`);
+        const data = Buffer.from(uncompressed.subarray(offset, offset + size)); offset += size; total += size;
+        if (total > MAX_TOTAL_RESOURCE_BYTES) throw new Error("Snapshot resources exceed total limit");
+        if (sha256Bytes(data) !== String(item.sha256)) throw new Error(`Resource hash mismatch: ${archivePath}`); resources[archivePath] = data;
+      }
+      SnapshotReader.#validate(manifest); return { manifest, resources };
     }
+    let envelope; try { envelope = JSON.parse(uncompressed.toString("utf8")); } catch (error) { throw new Error(`Invalid snapshot archive: ${error.message}`); }
     if (envelope?.format !== "uc-remote-sync-gzip-json-v1") throw new Error("Unsupported snapshot archive format");
-    const manifest = envelope.manifest;
-    const incomingSchema = Number(manifest?.schema_version);
-    if (!manifest || ![4, 5, SNAPSHOT_SCHEMA_VERSION].includes(incomingSchema)) throw new Error(`Unsupported snapshot schema ${manifest?.schema_version}`);
-    const resources = {};
-    for (const item of manifest.resources || []) {
-      const archivePath = String(item.archive_path || "");
-      if (!archivePath || archivePath.includes("..") || archivePath.startsWith("/") || archivePath.includes("\\")) throw new Error(`Unsafe resource archive path: ${archivePath}`);
-      const encoded = envelope.resources?.[archivePath];
-      if (typeof encoded !== "string") throw new Error(`Missing resource payload: ${archivePath}`);
-      const data = Buffer.from(encoded, "base64");
-      if (data.length !== Number(item.size)) throw new Error(`Resource size mismatch: ${archivePath}`);
-      if (sha256Bytes(data) !== String(item.sha256)) throw new Error(`Resource hash mismatch: ${archivePath}`);
-      resources[archivePath] = data;
-    }
-    const contentHash = sha256Bytes(canonicalJson({ data: manifest.data || {}, resources: manifest.resources || [], required_integrations: manifest.required_integrations || [] }));
-    if (contentHash !== String(manifest.content_hash)) throw new Error("Snapshot manifest content hash mismatch");
-    return { manifest, resources };
+    const manifest = envelope.manifest; const resources = {}; let total = 0;
+    for (const item of manifest?.resources || []) { const archivePath = String(item.archive_path || ""); if (!archivePath || archivePath.includes("..") || archivePath.startsWith("/") || archivePath.includes("\\")) throw new Error(`Unsafe resource archive path: ${archivePath}`); const encoded = envelope.resources?.[archivePath]; if (typeof encoded !== "string") throw new Error(`Missing resource payload: ${archivePath}`); const data = Buffer.from(encoded, "base64"); total += data.length; if (data.length > MAX_RESOURCE_BYTES || total > MAX_TOTAL_RESOURCE_BYTES) throw new Error(`Resource size limit exceeded: ${archivePath}`); if (data.length !== Number(item.size)) throw new Error(`Resource size mismatch: ${archivePath}`); if (sha256Bytes(data) !== String(item.sha256)) throw new Error(`Resource hash mismatch: ${archivePath}`); resources[archivePath] = data; }
+    SnapshotReader.#validate(manifest); return { manifest, resources };
   }
+  static #validate(manifest) { const incomingSchema = Number(manifest?.schema_version); if (!manifest || ![4,5,SNAPSHOT_SCHEMA_VERSION].includes(incomingSchema)) throw new Error(`Unsupported snapshot schema ${manifest?.schema_version}`); const contentHash = sha256Bytes(canonicalJson({ data: manifest.data || {}, resources: manifest.resources || [], required_integrations: manifest.required_integrations || [] })); if (contentHash !== String(manifest.content_hash)) throw new Error("Snapshot manifest content hash mismatch"); }
 }
