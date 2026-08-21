@@ -39,6 +39,26 @@ test("configuration migration creates backups before writing schema 6", () => {
   assert.ok(fs.readdirSync(directory).some((name) => name.includes("schema-4-to-6") && name.endsWith(".bak")));
 });
 
+test("controller bridge metadata survives load and save normalization", () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "remote-sync-controller-bridge-"));
+  const file = path.join(directory, "remote-sync.json");
+  const bridge = {
+    websocket_url: "ws://127.0.0.1:14001/ws",
+    managed_by: "uc-advanced-web-configurator",
+  };
+  fs.writeFileSync(file, `${JSON.stringify(validConfig({ controller_bridge: bridge }))}\n`);
+
+  const store = new ConfigStore(file);
+  const loaded = store.load();
+  assert.deepEqual(loaded.controller_bridge, bridge);
+
+  const saved = store.save(loaded);
+  assert.deepEqual(saved.controller_bridge, bridge);
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")).controller_bridge, bridge);
+
+  fs.rmSync(directory, { recursive: true, force: true });
+});
+
 test("directed broadcast IPv4 addresses are accepted", () => {
   const config = validateConfig(validConfig({
     remote: {
