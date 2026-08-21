@@ -8,6 +8,23 @@ import { ConfigurationError, normalizeAndValidateConfig, validateConfig } from "
 // Configuration persistence
 // -----------------------------------------------------------------------------
 
+function controllerBridgeMetadata(config) {
+  const source = config?.controller_bridge;
+  if (!source || typeof source !== "object" || Array.isArray(source)) return null;
+  const managedBy = String(source.managed_by || "").trim();
+  const websocketUrl = String(source.websocket_url || "").trim();
+  if (!managedBy && !websocketUrl) return null;
+  return {
+    ...(websocketUrl ? { websocket_url: websocketUrl } : {}),
+    ...(managedBy ? { managed_by: managedBy } : {}),
+  };
+}
+
+function preserveControllerBridge(source, normalized) {
+  const controllerBridge = controllerBridgeMetadata(source);
+  return controllerBridge ? { ...normalized, controller_bridge: controllerBridge } : normalized;
+}
+
 export class ConfigStore {
   constructor(filePath = path.join(configHome(), "remote-sync.json")) {
     this.filePath = filePath;
@@ -19,12 +36,13 @@ export class ConfigStore {
     if (!raw) return null;
     try {
       const result = normalizeAndValidateConfig(raw);
+      const normalized = preserveControllerBridge(raw, result.config);
       if (result.migrated) {
         this.backup(`schema-${result.from}-to-${result.to}`);
-        atomicWriteJson(this.filePath, result.config);
+        atomicWriteJson(this.filePath, normalized);
       }
       this.lastError = null;
-      return result.config;
+      return normalized;
     } catch (error) {
       this.lastError = error instanceof ConfigurationError ? error : new ConfigurationError(error.message, { cause: error });
       throw this.lastError;
@@ -32,7 +50,7 @@ export class ConfigStore {
   }
 
   save(config) {
-    const normalized = validateConfig(config);
+    const normalized = preserveControllerBridge(config, validateConfig(config));
     atomicWriteJson(this.filePath, normalized);
     this.lastError = null;
     return normalized;
