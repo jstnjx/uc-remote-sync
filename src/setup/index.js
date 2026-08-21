@@ -8,6 +8,8 @@ import { dropdown, label } from "./forms.js";
 // Setup role routing
 // -----------------------------------------------------------------------------
 
+const CONTROLLER_MANAGED_SETUP = "uc-advanced-web-configurator";
+
 export class SetupFlow {
   constructor(store, onConfigured, {
     discovery = new RemoteSyncDiscovery({ timeoutMs: 3000 }),
@@ -25,7 +27,7 @@ export class SetupFlow {
   }
 
   async handler(message) {
-    if (message instanceof uc.DriverSetupRequest) return this.#start(message.reconfigure);
+    if (message instanceof uc.DriverSetupRequest) return this.#start(message.reconfigure, message.setupData);
     if (message instanceof uc.AbortDriverSetup) {
       this.#reset();
       return new uc.SetupError();
@@ -37,8 +39,11 @@ export class SetupFlow {
     return new uc.SetupError();
   }
 
-  async #start(reconfigure) {
+  async #start(reconfigure, setupData = {}) {
     this.#reset();
+    if (setupData?.managed_by === CONTROLLER_MANAGED_SETUP) {
+      return this.#completeControllerManaged(setupData);
+    }
     let existing = null;
     if (reconfigure) {
       try { existing = this.store.load(); }
@@ -47,6 +52,32 @@ export class SetupFlow {
     if (existing?.role === "child") return this.#activateSatellite(existing);
     if (existing?.role === "master") return this.#activatePrimary(existing);
     return this.#roleForm();
+  }
+
+  async #completeControllerManaged(setupData) {
+    let existing;
+    try { existing = this.store.load(); }
+    catch (error) {
+      this.loadError = error.message;
+      return new uc.SetupError(uc.IntegrationSetupError.Other);
+    }
+    const expectedRole = setupData.role === "primary" || setupData.role === "master"
+      ? "master"
+      : setupData.role === "satellite" || setupData.role === "child"
+        ? "child"
+        : null;
+    if (!existing || !["child", "master"].includes(existing.role)) {
+      return new uc.SetupError(uc.IntegrationSetupError.Other);
+    }
+    if (expectedRole && existing.role !== expectedRole) {
+      return new uc.SetupError(uc.IntegrationSetupError.Other);
+    }
+    if (existing.controller_bridge?.managed_by !== CONTROLLER_MANAGED_SETUP) {
+      return new uc.SetupError(uc.IntegrationSetupError.AuthorizationError);
+    }
+    this.awaitingRole = false;
+    await this.onConfigured(existing);
+    return new uc.SetupComplete();
   }
 
   #roleForm() {
