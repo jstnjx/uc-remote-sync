@@ -141,6 +141,8 @@ export class ActivitySyncManager {
   }
 
   async initialize(peer, activities) {
+    // The primary is authoritative when a relationship is initialized. Never
+    // infer the initial state from a stale satellite activity.
     for (const record of activities || []) {
       const sourceActivityId = String(record?.source_id || "");
       const state = record?.detail?.attributes?.state ?? record?.detail?.state;
@@ -196,15 +198,32 @@ export class ActivitySyncManager {
       log.debug(`Could not read satellite activity state for ${targetActivityId}: ${error.message}`);
     }
 
-    const suppressionKey = `${sourceActivityId}|${action}`;
-    this.relaySuppressions.set(suppressionKey, Date.now() + 10_000);
+    // State reconciliation is deliberately passive. activity.on/activity.off
+    // execute the configured activity sequence and can therefore control real
+    // devices or relay commands back to the primary. A mirrored state update
+    // must never use those commands. If the Core cannot persist activity state
+    // through its configuration endpoint we fail closed and leave the display
+    // stale rather than executing an activity as a side effect.
+    const normalizedState = action === "on" ? "ON" : "OFF";
     try {
-      await client.executeEntityCommand(targetActivityId, `activity.${action}`);
+      const updated = await client.json("PATCH", `/activities/${encodeURIComponent(targetActivityId)}`, {
+        json: { attributes: { state: normalizedState } },
+        expected: [200]
+      });
+      let updatedState = updated?.attributes?.state ?? updated?.state;
+      if (!this.#stateMatchesAction(updatedState, action)) {
+        const verified = await client.getJson(`/activities/${encodeURIComponent(targetActivityId)}`, { optionalStatuses: [404] });
+        updatedState = verified?.attributes?.state ?? verified?.state;
+      }
+      if (!this.#stateMatchesAction(updatedState, action)) {
+        throw new Error(`Core did not persist passive activity state ${normalizedState}`);
+      }
       this.#recordVersion(sourceActivityId, source_epoch, revision);
-      return { success: true, changed: true, target_activity_id: targetActivityId, action };
+      return { success: true, changed: true, target_activity_id: targetActivityId, action, passive: true };
     } catch (error) {
-      this.relaySuppressions.delete(suppressionKey);
-      return { success: false, status: error.status || 502, error: error.message, target_activity_id: targetActivityId };
+      const detail = `Passive activity state update failed for ${targetActivityId}: ${error.message}. Refusing to execute activity.${action} during state reconciliation.`;
+      log.warn(detail);
+      return { success: false, status: error.status || 502, error: detail, target_activity_id: targetActivityId, safe_failure: true };
     }
   }
 
