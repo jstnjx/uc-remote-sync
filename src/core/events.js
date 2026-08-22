@@ -6,6 +6,16 @@ import { sleep } from "../shared/util.js";
 
 const log = logger("core-ws");
 
+export function coreWebSocketRequestTimeoutMs(name, data, requestedTimeoutMs = 10_000) {
+  const requested = Number.isFinite(Number(requestedTimeoutMs))
+    ? Math.max(0, Number(requestedTimeoutMs))
+    : 10_000;
+  if (String(name) !== "configure_entities_from_integration") return requested;
+  const count = Array.isArray(data?.entity_ids) ? data.entity_ids.length : 0;
+  const adaptive = Math.min(600_000, Math.max(180_000, 60_000 + (count * 2_500)));
+  return Math.max(requested, adaptive);
+}
+
 // -----------------------------------------------------------------------------
 // Core WebSocket client
 // -----------------------------------------------------------------------------
@@ -68,8 +78,9 @@ export class CoreWebSocket {
     const id = this.requestId++;
     const payload = { kind: "req", id, msg: name };
     if (data !== undefined) payload.msg_data = data;
+    const effectiveTimeoutMs = coreWebSocketRequestTimeoutMs(name, data, timeoutMs);
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => { this.pending.delete(id); reject(new Error(`Core WebSocket ${name} timed out`)); }, timeoutMs);
+      const timer = setTimeout(() => { this.pending.delete(id); reject(new Error(`Core WebSocket ${name} timed out`)); }, effectiveTimeoutMs);
       this.pending.set(id, { resolve, reject, timer, name });
       try { this.socket.send(JSON.stringify(payload)); }
       catch (error) { clearTimeout(timer); this.pending.delete(id); reject(error); }
