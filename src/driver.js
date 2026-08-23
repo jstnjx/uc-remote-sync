@@ -5,9 +5,12 @@ import { ConfigStore } from "./config/store.js";
 import { DEFAULT_INTEGRATION_PORT } from "./shared/constants.js";
 import { driverJsonPath } from "./shared/paths.js";
 import { RemoteSyncService } from "./service/index.js";
+import { installLiveProxyStateCompatibility } from "./service/live-proxy-state-compatibility.js";
 import { SetupFlow } from "./setup/index.js";
 import { EntityManager } from "./integration/entities.js";
 import { logger } from "./shared/logger.js";
+
+installLiveProxyStateCompatibility();
 
 const log = logger("driver");
 
