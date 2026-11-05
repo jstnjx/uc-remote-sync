@@ -4,20 +4,6 @@
 
 UC Remote Sync synchronizes one Primary Unfolded Circle Remote with one or more Satellite remotes. It can run directly on Remote Two/3 or as an external Primary through Docker or Node.js. Satellite instances must run directly on their remotes because the virtual Dock endpoint uses loopback networking.
 
-## What's new in 0.9.0
-
-- **Add Satellites by IP address and PIN.** The Primary creates a management key on the Satellite, installs or updates Remote Sync there, runs the Satellite setup remotely and pairs — no token copying.
-- **Satellites stay on the Primary's version.** Satellites added by PIN are updated automatically (`POST /api/intg/install?update=true`), replacing the manual rolling-upgrade order. Can be turned off.
-- **PIN-only integration setup.** The Remote's setup dialog asks for the Web Configurator PIN and nothing else (hidden field, English/German, wrong PIN corrected in place on Remotes with API 0.19.0+). The role and all other options moved to the dashboard.
-- **Web dashboard** at `http://<remote>:11081/ui`, styled like Advanced Automations: choose the role, add and manage Satellites, readable preview diffs, settings and live logs. Sign in with the remote's Web Configurator PIN.
-- **Wake on WLAN is detected and enabled automatically** (`wifi.wake_on_wlan`) instead of being confirmed by hand.
-- **One shared Core WebSocket session** per remote instead of one connection per request, with back-off when the Core reports its connection limit (`503` + `Retry-After`).
-- **Activity readiness:** relayed activity commands log which devices would not be reached (`/activities/{id}/readiness`).
-- **Removing a Satellite cleans it up.** *Remove* deletes everything this Primary synchronized to the Satellite — profiles with their pages and groups, activity groups, activities, macros, proxied Docks, mirrored entities, the activity relay and synchronized resources — before unpairing. *Unpair* keeps the configuration.
-- **Remote screen preview.** The dashboard preview renders the Primary's profiles and pages on a Remote screen at the native 480 × 850 layout — page through screens, open activities and entities, switch profiles. Read-only: nothing is sent to a remote.
-- **New logo** in the Advanced Automations style (`remote-sync.svg`, `remote-sync.png`).
-- **No more `ALREADY_EXISTS` when adding a Satellite again.** API key names are unique, a clash is retried, and keys Remote Sync no longer needs (previous setup, removed or re-added Satellites) are revoked.
-- **Fewer entities:** each Satellite is now one status sensor and one action select instead of six sensors and seven buttons. Recreate any activity buttons that used the old per-Satellite buttons.
 
 ## Requirements
 
