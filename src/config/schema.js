@@ -100,6 +100,11 @@ function normalizePeer(item, index, errors) {
     child_node_id: text(item?.child_node_id) || null,
     claimed_at: text(item?.claimed_at) || null,
     command_token: token(item?.command_token, `peers[${index}].command_token`, errors, { min: 16, nullable: true }) || null,
+    core_api_key: token(item?.core_api_key, `peers[${index}].core_api_key`, errors, { min: 8, nullable: true }) || null,
+    core_key_name: text(item?.core_key_name) || null,
+    core_host: text(item?.core_host) || null,
+    core_scheme: ["http", "https"].includes(text(item?.core_scheme).toLowerCase()) ? text(item.core_scheme).toLowerCase() : null,
+    core_port: port(item?.core_port, `peers[${index}].core_port`, errors, null),
     protocol: item?.protocol && typeof item.protocol === "object" ? structuredClone(item.protocol) : null
   };
 }
@@ -148,8 +153,9 @@ export function normalizeAndValidateConfig(input) {
   const { config: data, migrated, from, to } = migrateConfig(input);
   const remote = data.remote && typeof data.remote === "object" ? data.remote : {};
   const sync = data.sync && typeof data.sync === "object" ? data.sync : {};
-  const role = data.role === "child" ? "child" : data.role === "master" ? "master" : null;
-  if (!role) errors.push("role must be master or child");
+  // "unassigned": the integration setup only collected the PIN; the role is chosen in the web dashboard.
+  const role = data.role === "child" ? "child" : data.role === "master" ? "master" : data.role === "unassigned" ? "unassigned" : null;
+  if (!role) errors.push("role must be master, child or unassigned");
 
   const sourceSections = Array.isArray(sync.sections) ? sync.sections.map(text) : [...DEFAULT_SECTIONS];
   const sections = [...new Set(sourceSections.filter((item) => DEFAULT_SECTIONS.includes(item)))];
@@ -193,6 +199,7 @@ export function normalizeAndValidateConfig(input) {
     remote: {
       host: requiredText(remote.host, "remote.host", errors),
       api_key: token(remote.api_key, "remote.api_key", errors, { min: 8 }),
+      api_key_name: text(remote.api_key_name) || null,
       scheme: ["http", "https"].includes(text(remote.scheme).toLowerCase()) ? text(remote.scheme).toLowerCase() : "http",
       port: port(remote.port, "remote.port", errors, null),
       mac: mac(remote.mac, "remote.mac", errors),
@@ -220,7 +227,8 @@ export function normalizeAndValidateConfig(input) {
       auto_sync: sync.auto_sync !== false,
       prune: sync.prune === true,
       use_standby_inhibitor: sync.use_standby_inhibitor !== false,
-      verify_existing_resource_hashes: sync.verify_existing_resource_hashes === true
+      verify_existing_resource_hashes: sync.verify_existing_resource_hashes === true,
+      auto_update_satellites: sync.auto_update_satellites !== false
     }
   };
 

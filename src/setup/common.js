@@ -78,16 +78,28 @@ export function setupErrorType(error) {
 }
 
 export function setupErrorMessage(error) {
-  if (error instanceof CoreApiError && [401, 403].includes(error.status)) return "The PIN or API authorization was rejected.";
-  if (error.name === "AbortError" || error.code === "ETIMEDOUT") return "The remote did not respond before the setup timeout.";
+  if (error instanceof CoreApiError && [401, 403].includes(error.status)) return { en: "The PIN or API authorization was rejected.", de: "Die PIN oder API-Berechtigung wurde abgelehnt." };
+  if (error.name === "AbortError" || error.code === "ETIMEDOUT") return { en: "The remote did not respond before the setup timeout.", de: "Die Fernbedienung hat nicht rechtzeitig geantwortet." };
+  if (error.code === "ECONNREFUSED" || error.cause?.code === "ECONNREFUSED" || error.cause?.code === "EHOSTUNREACH") return { en: `The remote is not reachable: ${error.message}`, de: `Die Fernbedienung ist nicht erreichbar: ${error.message}` };
   return error.message || "Setup failed.";
 }
 
-export function approvalPrompt(message = "Approve the Remote Sync API-key request on the remote, then continue.") {
+export function approvalPrompt(message = { en: "Approve the Remote Sync API-key request on the remote, then continue.", de: "Bestätige die API-Schlüssel-Anfrage von Remote Sync auf der Fernbedienung und fahre dann fort." }) {
   return new uc.RequestUserConfirmation(
-    { en: "Approve API access" },
-    { en: message },
+    { en: "Approve API access", de: "API-Zugriff bestätigen" },
+    typeof message === "string" ? { en: message } : message,
     undefined,
-    { en: "Continue after approval." }
+    { en: "Continue after approval.", de: "Nach der Bestätigung fortfahren." }
   );
+}
+
+export function wakeOnWlanText(state) {
+  if (state === true) return { en: "Enabled — the remote stays reachable in standby.", de: "Aktiviert — die Fernbedienung bleibt im Standby erreichbar." };
+  if (state === false) return { en: "Disabled — Remote Sync cannot wake this remote. It will be enabled when the checkbox below is ticked.", de: "Deaktiviert — Remote Sync kann diese Fernbedienung nicht aufwecken. Sie wird aktiviert, wenn das Kästchen unten markiert ist." };
+  return { en: "Unknown — this firmware does not report the setting. Enable \"Keep Wi-Fi connected during standby\" manually.", de: "Unbekannt — diese Firmware meldet die Einstellung nicht. Aktiviere \"WLAN im Standby verbunden lassen\" manuell." };
+}
+
+export function dashboardUrl(config, agentUrl = null) {
+  const base = String(agentUrl || config?.agent_public_url || "").replace(/\/$/, "");
+  return base ? `${base}/ui` : null;
 }

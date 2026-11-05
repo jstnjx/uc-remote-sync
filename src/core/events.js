@@ -27,18 +27,42 @@ export class CoreWebSocket {
     this.socket = null;
     this.requestId = 1;
     this.pending = new Map();
+    this.connecting = null;
   }
 
+  get connected() { return this.socket?.readyState === WebSocketPeer.OPEN; }
+
   async connect() {
-    if (this.socket?.readyState === WebSocketPeer.OPEN) return;
-    this.socket = await connectWebSocket(endpointWsUrl(this.endpoint), {
-      headers: { "API-KEY": this.endpoint.api_key },
-      timeoutMs: 9000,
-      rejectUnauthorized: this.endpoint.verify_tls !== false
-    });
-    this.socket.on("message", (raw) => this.#handleMessage(raw));
-    this.socket.on("close", () => this.#rejectPending(new Error("Core WebSocket closed")));
-    this.socket.on("error", (error) => this.#rejectPending(error));
+    if (this.connected) return;
+    if (this.connecting) return this.connecting;
+    this.connecting = this.#open().finally(() => { this.connecting = null; });
+    return this.connecting;
+  }
+
+  async #open() {
+    // The Core limits concurrent WebSocket sessions and answers 503 with a retry period when the limit is reached.
+    let lastError = null;
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      try {
+        const socket = await connectWebSocket(endpointWsUrl(this.endpoint), {
+          headers: { "API-KEY": this.endpoint.api_key },
+          timeoutMs: 9000,
+          rejectUnauthorized: this.endpoint.verify_tls !== false
+        });
+        this.socket = socket;
+        socket.on("message", (raw) => this.#handleMessage(raw));
+        socket.on("close", () => { if (this.socket === socket) this.socket = null; this.#rejectPending(new Error("Core WebSocket closed")); });
+        socket.on("error", (error) => this.#rejectPending(error));
+        return;
+      } catch (error) {
+        lastError = error;
+        if (error?.status !== 503) throw error;
+        const wait = Math.min(30_000, Math.max(500, Number(error.retryAfterMs ?? 2000 * (attempt + 1))));
+        log.warn(`Core WebSocket connection limit reached; retrying in ${Math.round(wait / 1000)}s`);
+        await sleep(wait);
+      }
+    }
+    throw lastError;
   }
 
   #handleMessage(raw) {
@@ -118,6 +142,7 @@ export class CoreEventWatcher {
         await new Promise((resolve) => this.client.socket.once("close", resolve));
       } catch (error) {
         if (!this.stopped) log.warn("Core event stream disconnected:", error.message);
+        if (error?.retryAfterMs) await sleep(Math.min(60_000, error.retryAfterMs));
       } finally {
         await this.client?.close();
         this.client = null;

@@ -1,12 +1,21 @@
+import fs from "node:fs";
+import { driverJsonPath } from "./paths.js";
+
 // -----------------------------------------------------------------------------
 // Application metadata
 // -----------------------------------------------------------------------------
+
+// driver.json is the single source of the release version (package.json is checked against it at build time).
+function driverVersion() {
+  try { return String(JSON.parse(fs.readFileSync(driverJsonPath(), "utf8")).version || "0.0.0"); }
+  catch { return "0.0.0"; }
+}
 
 export const APP_NAME = "Remote Sync";
 export const DRIVER_ID = "remote_sync";
 export const ACTIVITY_RELAY_LOCAL_ID = "activity_relay";
 export const ACTIVITY_RELAY_ENTITY_ID = `${DRIVER_ID}.main.${ACTIVITY_RELAY_LOCAL_ID}`;
-export const APP_VERSION = "0.8.0";
+export const APP_VERSION = driverVersion();
 export const SCHEMA_VERSION = 6;
 export const SNAPSHOT_SCHEMA_VERSION = 6;
 export const AGENT_API_VERSION = 1;
@@ -56,5 +65,5 @@ export const BAD_INTEGRATION_STATES = new Set([
 ]);
 export const CONFIG_EVENT_NAMES = new Set([
   "integration_change", "integration_driver_change", "entity_change", "activity_group_change",
-  "profile_change", "dock_change"
+  "profile_change", "active_profile_change", "dock_change"
 ]);

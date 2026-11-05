@@ -27,6 +27,17 @@ function proxyEntity(descriptor, service) {
   );
 }
 
+const SATELLITE_ACTIONS = Object.freeze([
+  { action: "sync", label: "Synchronize" },
+  { action: "preview", label: "Preview" },
+  { action: "update", label: "Update Remote Sync", when: (satellite) => satellite.managed },
+  { action: "disable", label: "Disable", when: (satellite) => satellite.enabled },
+  { action: "enable", label: "Enable", when: (satellite) => !satellite.enabled },
+  { action: "rediscover", label: "Rediscover" },
+  { action: "rotate", label: "Rotate credentials" },
+  { action: "unpair", label: "Unpair" }
+]);
+
 function satelliteKey(peerId) {
   return crypto.createHash("sha256").update(String(peerId)).digest("hex").slice(0, 12);
 }
@@ -99,10 +110,6 @@ export class EntityManager {
     });
   }
 
-  #button(id, name, icon, handler) {
-    return new uc.Button(id, { en: name }, { icon, cmdHandler: handler });
-  }
-
   // -------------------------------------------------------------------------
   // Proxy catalog
   // -------------------------------------------------------------------------
@@ -133,6 +140,8 @@ export class EntityManager {
   // Satellite management entities
   // -------------------------------------------------------------------------
 
+  // One status sensor and one action select per Satellite. Detailed information (version, network, errors, preview
+  // results) lives in the web dashboard; previous releases exposed six sensors and seven buttons per Satellite.
   #applySatellites(config) {
     const next = new Set();
     if (config?.role !== "master") {
@@ -142,50 +151,51 @@ export class EntityManager {
     for (const satellite of this.service.listSatellites(false)) {
       const key = satelliteKey(satellite.peer_id);
       const prefix = `satellite_${key}`;
-      const values = {
-        [`${prefix}_status`]: satellite.online ? (satellite.enabled ? "Online" : "Online, disabled") : (satellite.enabled ? "Offline" : "Disabled"),
-        [`${prefix}_version`]: satellite.version || satellite.protocol?.version || "Unknown",
-        [`${prefix}_last_sync`]: satellite.last_sync_at || "Never",
-        [`${prefix}_last_error`]: satellite.last_error || "None",
-        [`${prefix}_network`]: `${satellite.mac || "MAC unavailable"} — ${(satellite.broadcasts || []).join(", ") || "broadcast unavailable"}`,
-        [`${prefix}_objects`]: `${satellite.mirrored_entities || 0} mirrored entities — ${satellite.dock_tunnels || 0} Dock tunnels`
-      };
-      for (const [id, value] of Object.entries(values)) {
-        const title = id.endsWith("_status") ? `${satellite.name} status`
-          : id.endsWith("_version") ? `${satellite.name} version`
-            : id.endsWith("_last_sync") ? `${satellite.name} last synchronization`
-              : id.endsWith("_last_error") ? `${satellite.name} last error`
-                : id.endsWith("_network") ? `${satellite.name} network`
-                  : `${satellite.name} synchronized objects`;
-        const entity = this.#sensor(id, title, value, "uc:server");
-        next.add(entity.id);
-        this.api.upsertAvailableEntity(entity);
-        this.#updateValue(entity.id, value);
-      }
-      const actions = [
-        ["sync", "Synchronize", "uc:arrow-path", "sync"],
-        ["preview", "Preview", "uc:document-magnifying-glass", "preview"],
-        ["toggle", satellite.enabled ? "Disable" : "Enable", "uc:power", satellite.enabled ? "disable" : "enable"],
-        ["rediscover", "Rediscover", "uc:signal", "rediscover"],
-        ["rotate", "Rotate credentials", "uc:key", "rotate"],
-        ["unpair", "Unpair", "uc:link-slash", "unpair"],
-        ["remove", "Remove", "uc:trash", "remove"]
-      ];
-      for (const [suffix, actionName, icon, action] of actions) {
-        const entity = this.#button(`${prefix}_${suffix}`, `${actionName} ${satellite.name}`, icon, async () => {
+      const state = satellite.updating ? "Updating"
+        : satellite.online ? (satellite.enabled ? "Online" : "Online, disabled") : (satellite.enabled ? "Offline" : "Disabled");
+      const summary = [
+        state,
+        satellite.version || satellite.protocol?.version || null,
+        satellite.last_sync_at ? `synced ${satellite.last_sync_at}` : "never synced",
+        satellite.last_error ? `error: ${satellite.last_error}` : null
+      ].filter(Boolean).join(" — ");
+      const sensor = this.#sensor(`${prefix}_status`, `${satellite.name} status`, summary, "uc:server");
+      next.add(sensor.id);
+      this.api.upsertAvailableEntity(sensor);
+      this.#updateValue(sensor.id, summary);
+
+      const actions = SATELLITE_ACTIONS.filter((item) => !item.when || item.when(satellite));
+      const options = actions.map((item) => item.label);
+      const select = new uc.Select(`${prefix}_action`, { en: `${satellite.name} action`, de: `${satellite.name} Aktion` }, {
+        icon: "uc:server",
+        options,
+        currentOption: "",
+        cmdHandler: async (_entity, cmdId, params) => {
+          if (cmdId !== "select_option") return uc.StatusCodes.NotImplemented;
+          const selected = actions.find((item) => item.label === String(params?.option || ""));
+          if (!selected) return uc.StatusCodes.BadRequest;
+          this.#updateSelect(`${prefix}_action`, { current_option: selected.label });
           try {
-            const result = await this.service.manageSatellite(satellite.peer_id, action);
+            const result = await this.service.manageSatellite(satellite.peer_id, selected.action);
             return result?.success === false ? uc.StatusCodes.ServiceUnavailable : uc.StatusCodes.Ok;
           } catch {
             return uc.StatusCodes.ServiceUnavailable;
+          } finally {
+            this.#updateSelect(`${prefix}_action`, { current_option: "" });
           }
-        });
-        next.add(entity.id);
-        this.api.upsertAvailableEntity(entity);
-      }
+        }
+      });
+      next.add(select.id);
+      this.api.upsertAvailableEntity(select);
+      this.#updateSelect(select.id, { options, state: uc.SelectStates.On });
     }
     this.#removeSatelliteEntities(next);
     this.satelliteIds = next;
+  }
+
+  #updateSelect(id, attributes) {
+    this.api.getAvailableEntities().updateEntityAttributes(id, attributes);
+    this.api.updateEntityAttributes(id, attributes);
   }
 
   #removeSatelliteEntities(next) {
@@ -214,7 +224,7 @@ export class EntityManager {
     if (!this.registered) return;
     const values = {
       status: status.state,
-      role: config?.role === "master" ? "primary" : config?.role === "child" ? "satellite" : "unconfigured",
+      role: config?.role === "master" ? "primary" : config?.role === "child" ? "satellite" : config?.role === "unassigned" ? "role not chosen" : "unconfigured",
       last_sync: status.last_sync_at || "Never",
       last_result: status.last_sync_result,
       last_preview: status.last_preview_result || "Never",

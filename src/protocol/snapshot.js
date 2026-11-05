@@ -43,6 +43,20 @@ function mergeAvailableMetadata(configured, available) {
 }
 
 // -----------------------------------------------------------------------------
+// Change detection
+// -----------------------------------------------------------------------------
+
+const VOLATILE_KEYS = new Set(["attributes", "state", "device_state", "driver_state", "connection_state", "connected", "online", "last_seen", "updated_at", "media_position_updated_at"]);
+
+export function stableConfiguration(value) {
+  if (Array.isArray(value)) return value.map(stableConfiguration);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).filter(([key]) => !VOLATILE_KEYS.has(key)).map(([key, item]) => [key, stableConfiguration(item)]));
+  }
+  return value;
+}
+
+// -----------------------------------------------------------------------------
 // Snapshot creation
 // -----------------------------------------------------------------------------
 
@@ -82,6 +96,9 @@ export class SnapshotBuilder {
     if (sections.includes("resources")) { await this.#collectResources(resources, payloads); log.info(`Collected ${resources.length} resource file(s)`); }
     const requiredIntegrations = [...this.#requiredIntegrations(data.entities || [])].sort();
     const contentHash = sha256Bytes(canonicalJson({ data, resources, required_integrations: requiredIntegrations }));
+    // Live state (entity attributes, integration and dock states) changes all the time. The change hash ignores it,
+    // so automatic synchronization only pushes when the configuration itself changed.
+    const changeHash = sha256Bytes(canonicalJson({ data: stableConfiguration(data), resources: resources.map(({ type, id, sha256 }) => ({ type, id, sha256 })), required_integrations: requiredIntegrations }));
     const manifest = {
       schema_version: SNAPSHOT_SCHEMA_VERSION,
       protocol_version: PROTOCOL_VERSION,
@@ -93,6 +110,7 @@ export class SnapshotBuilder {
       sections,
       required_integrations: requiredIntegrations,
       content_hash: contentHash,
+      change_hash: changeHash,
       data,
       resources,
       warnings: [...this.warnings]
@@ -151,10 +169,12 @@ export class SnapshotBuilder {
 
     for (const [integrationId, records] of groups) {
       try {
-        const available = await this.client.reloadAvailableEntities(integrationId, {
-          requiredEntityIds: records.map((record) => record.localId),
-          pageSize: 100
-        });
+        // The Core's cached list is enough for names, icons and options. A forced reload makes the integration
+        // enumerate every device again (over 1000 entities for a large Home Assistant setup), so it is only used
+        // when the cache is empty.
+        const requiredEntityIds = records.map((record) => record.localId);
+        let available = await this.client.reloadAvailableEntities(integrationId, { requiredEntityIds, pageSize: 100, forceReload: false });
+        if (!available?.length) available = await this.client.reloadAvailableEntities(integrationId, { requiredEntityIds, pageSize: 100, forceReload: true });
         const byLocalId = new Map();
         for (const item of available || []) {
           const id = firstIdentifier(item, "entity_id", "id");
@@ -282,8 +302,9 @@ export class SnapshotBuilder {
         if (buttons !== null) record.buttons = buttons;
         if (ui !== null || pages.length) record.ui = { ...(ui && typeof ui === "object" ? ui : {}), pages };
         if (endpoint === "remotes") {
-          const ir = await this.#getOptional(`/${endpoint}/${encoded}/ir`);
-          const bt = await this.#getOptional(`/${endpoint}/${encoded}/bt`);
+          // Only IR remotes have IR data and only Bluetooth remotes have BT data; 400/404 are the normal answer.
+          const ir = await this.#getOptional(`/${endpoint}/${encoded}/ir`, true, [400, 404, 405]);
+          const bt = await this.#getOptional(`/${endpoint}/${encoded}/bt`, true, [400, 404, 405]);
           if (ir !== null) record.ir = ir;
           if (bt !== null) record.bt = bt;
         }
@@ -329,12 +350,14 @@ export class SnapshotBuilder {
       items.push(record);
     }
     let active = null;
-    for (const endpoint of ["/profiles/active", "/profiles/active_profile"]) {
-      active = await this.#getOptional(endpoint, true);
-      if (active !== null) break;
-    }
-    if (active === null && typeof this.client.coreMessage === "function") {
+    if (typeof this.client.coreMessage === "function") {
       try { active = await this.client.coreMessage("get_active_profile", undefined, 30_000); } catch {}
+    }
+    if (active === null || active === undefined) {
+      for (const endpoint of ["/profiles/active", "/profiles/active_profile"]) {
+        active = await this.#getOptional(endpoint, true);
+        if (active !== null) break;
+      }
     }
     return { items, active };
   }
@@ -377,8 +400,8 @@ export class SnapshotBuilder {
     catch (error) { this.warnings.push(`Optional endpoint ${endpoint} failed: ${error.message}`); return []; }
   }
 
-  async #getOptional(endpoint, quiet = false) {
-    try { return await this.client.getJson(endpoint, { optionalStatuses: [404, 405] }); }
+  async #getOptional(endpoint, quiet = false, optionalStatuses = [404, 405]) {
+    try { return await this.client.getJson(endpoint, { optionalStatuses }); }
     catch (error) {
       if (!quiet) this.warnings.push(`Optional endpoint ${endpoint} failed: ${error.message}`);
       return null;

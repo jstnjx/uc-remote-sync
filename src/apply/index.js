@@ -112,19 +112,21 @@ export class SnapshotApplier {
         const resourceId = String(item.id);
         const sourcePayload = resources[item.archive_path];
         const current = existing.get(resourceId);
+        // Remember every synchronized resource so removing the Satellite can delete it again.
+        const remember = () => this.mappings.set(manifest.source_node_id, `resource:${resourceType}`, resourceId, resourceId);
         if (current) {
           const sameSize = Number(current.size ?? -1) === Number(item.size);
-          if (sameSize && !this.config.sync.verify_existing_resource_hashes) { incrementReport(report, "resources_skipped"); continue; }
+          if (sameSize && !this.config.sync.verify_existing_resource_hashes) { remember(); incrementReport(report, "resources_skipped"); continue; }
           if (sameSize) {
             try {
               const targetPayload = await this.client.bytes("GET", `/resources/${encodeURIComponent(resourceType)}/${encodeURIComponent(resourceId)}`, { expected: [200], timeoutMs: 15_000 });
-              if (sha256Bytes(targetPayload) === String(item.sha256)) { incrementReport(report, "resources_skipped"); continue; }
+              if (sha256Bytes(targetPayload) === String(item.sha256)) { remember(); incrementReport(report, "resources_skipped"); continue; }
             } catch (error) { report.warnings.push(`Could not verify existing resource ${resourceType}/${resourceId}: ${error.message}`); }
           }
           await this.client.deleteResource(resourceType, resourceId);
         }
-        try { await this.client.uploadResource(resourceType, resourceId, sourcePayload); incrementReport(report, "resources_uploaded"); }
-        catch (error) { if (error instanceof CoreApiError && error.status === 422) incrementReport(report, "resources_skipped"); else report.errors.push(error.message); }
+        try { await this.client.uploadResource(resourceType, resourceId, sourcePayload); remember(); incrementReport(report, "resources_uploaded"); }
+        catch (error) { if (error instanceof CoreApiError && error.status === 422) { remember(); incrementReport(report, "resources_skipped"); } else report.errors.push(error.message); }
       }
     }
   }

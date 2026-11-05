@@ -27,7 +27,8 @@ export function driverJsonPath() {
     path.resolve("driver.json"),
     path.resolve(path.dirname(process.execPath), "..", "driver.json"),
     path.resolve(path.dirname(process.execPath), "driver.json"),
-    path.resolve(moduleDir, "..", "driver.json")
+    path.resolve(moduleDir, "..", "driver.json"),
+    path.resolve(moduleDir, "..", "..", "driver.json")
   ];
   return candidates.find((candidate) => fs.existsSync(candidate)) || candidates[0];
 }

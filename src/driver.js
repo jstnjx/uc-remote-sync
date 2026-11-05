@@ -30,7 +30,9 @@ export class Driver {
     this.service = new RemoteSyncService(this.store);
     this.entities = new EntityManager(this.api, this.service);
 
-    this.setup = new SetupFlow(this.store, (config) => this.service.configure(config));
+    this.setup = new SetupFlow(this.store, (config) => this.service.configure(config), {
+      remoteHint: () => this.api.lastRemoteAddress || null
+    });
     this.#events();
   }
   #events() {
@@ -39,6 +41,7 @@ export class Driver {
     this.api.on(uc.Events.EnterStandby, () => log.debug("Host remote entered standby"));
     this.api.on(uc.Events.ExitStandby, () => { log.debug("Host remote exited standby; reconciling Core state"); this.service.reconcile(); });
     this.api.on(uc.Events.SubscribeEntities, (entityIds) => this.entities.refreshSubscribed(entityIds));
+    this.api.on("remote_info", (info) => this.service.setRemoteInfo(info));
   }
   async start() {
     const port = Number(process.env.UC_INTEGRATION_HTTP_PORT || DEFAULT_INTEGRATION_PORT);

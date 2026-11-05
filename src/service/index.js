@@ -1,23 +1,32 @@
 import { monitorEventLoopDelay } from "node:perf_hooks";
 import { AgentServer } from "../agent/server.js";
 import { SnapshotApplier } from "../apply/index.js";
-import { CoreClient } from "../core/client.js";
+import { CoreApiError, CoreClient } from "../core/client.js";
 import { CoreEventWatcher } from "../core/events.js";
 import { MappingStore } from "../storage/mappings.js";
 import { createApplyReport, createStatus, finishReport, redactConfig } from "../shared/models.js";
 import { OperationCache } from "../storage/operations.js";
 import { buildProxyCatalog, ProxyCatalogStore } from "../proxy/catalog.js";
-import { defaultPairingUrl, RemoteSyncDiscovery } from "../pairing/mdns.js";
+import { defaultPairingUrl, generatePairingIdentifier, normalizePairingIdentifier, RemoteSyncDiscovery } from "../pairing/mdns.js";
 import { isTransportError, reachableAgentUrl, secureToken, sleep, utcNow } from "../shared/util.js";
+import { PeerAgentClient } from "./peer-agent-client.js";
 import { sendMagicPacket } from "../network/wol.js";
 import { FULL_AUDIT_INTERVAL_MS, MAX_AUTO_SYNC_RSS_BYTES, MAX_EVENT_LOOP_DELAY_MS, MIN_EVENT_SYNC_INTERVAL_MS, PEER_RETRY_BACKOFF_MS, PERIODIC_JITTER_RATIO, WAKE_RETRY_SCHEDULE_MS, WAKE_TIMEOUT_MS } from "../shared/constants.js";
 import { logger } from "../shared/logger.js";
 import { bridgeMasterDockTunnel, physicalDockConnection, virtualDockToken, VirtualDockServer } from "../dock/proxy.js";
 import { ConfigurationError } from "../config/store.js";
 import { buildApplyPreview } from "../apply/preview.js";
+import { SatellitePurger } from "../apply/purge.js";
 import { SatelliteManager } from "./satellite-manager.js";
 import { SyncCoordinator } from "./sync-coordinator.js";
 import { ActivitySyncManager } from "./activity-sync.js";
+import { provisionSatelliteByPin, revokeManagementKey } from "./satellite-provisioner.js";
+import { inspectManualSatellite } from "../setup/manual-satellite.js";
+import { networkOverrides, physicalDockTokens } from "../setup/common.js";
+import { detectRemoteNetworkIdentity } from "../network/identity.js";
+import { isPairingIdentifier } from "../pairing/config.js";
+import { createUiHandler } from "../web/server.js";
+import { APP_VERSION, DEFAULT_SECTIONS } from "../shared/constants.js";
 
 const log = logger("service");
 
@@ -55,6 +64,9 @@ export class RemoteSyncService {
     this.virtualDockServer = null;
     this.masterDockCatalog = new Map();
     this.dockTunnelSessions = new Set();
+    this.remoteInfo = null;
+    this.provisioning = new Map();
+    this.uiHandler = createUiHandler(this);
     this.syncCoordinator = new SyncCoordinator({
       getConfig: () => this.config,
       getClient: () => this.client,
@@ -76,6 +88,7 @@ export class RemoteSyncService {
       resolvePeer: (peer, force) => this.syncCoordinator.resolvePeerUrl(peer, force),
       syncPeer: (peer, force) => this.syncCoordinator.syncSinglePeer(peer, force),
       previewPeer: (peer) => this.syncNow(true, { dryRun: true, peerId: peer.peer_id }),
+      syncedResources: () => (this.syncCoordinator.cachedSnapshot()?.manifest?.resources || []).map((item) => ({ type: item.type, id: item.id })),
       notify: () => this.#notify()
     });
   }
@@ -133,18 +146,21 @@ export class RemoteSyncService {
       pairingCallback: (pairing) => this.markPaired(pairing),
       credentialCallback: (request) => this.rotateSatelliteCredentials(request),
       unpairCallback: (request) => this.unpairSatellite(request),
+      purgeCallback: (request) => this.purgeSynchronized(request),
       satelliteListCallback: (refresh) => refresh ? this.satelliteManager.refresh() : this.satelliteManager.list(),
       satelliteActionCallback: (peerId, action) => this.satelliteManager.action(peerId, action),
       commandCallback: (command) => this.executeProxyCommand(command),
       activityStateCallback: (update) => this.activitySync.apply(update),
-      dockTunnelCallback: (request) => this.openDockTunnel(request)
+      dockTunnelCallback: (request) => this.openDockTunnel(request),
+      pinPairingCallback: (coreKey) => this.pinPair(coreKey),
+      uiHandler: this.uiHandler
     });
     await this.agent.start();
     try {
       const { ready, bad } = await this.client.ready();
-      this.status.state = ready
-        ? (config.role === "child" && config.pairing?.ready_to_pair !== false ? "ready to pair" : "connected")
-        : `degraded: ${JSON.stringify(bad)}`;
+      this.status.state = !ready ? `degraded: ${JSON.stringify(bad)}`
+        : config.role === "unassigned" ? "choose a role"
+          : (config.role === "child" && config.pairing?.ready_to_pair !== false ? "ready to pair" : "connected");
     } catch (error) { this.status.state = `unreachable: ${error.message}`; }
     if (config.role === "master") {
       this.watcher = new CoreEventWatcher(config.remote, (events) => this.#configurationEvents(events), {
@@ -174,6 +190,7 @@ export class RemoteSyncService {
     await this.virtualDockServer?.stop(); this.virtualDockServer = null;
     this.masterDockCatalog.clear();
     this.activitySync.clear();
+    try { await this.client?.close?.(); } catch (error) { log.debug("Core client close failed:", error.message); }
     this.client = null;
   }
 
@@ -294,7 +311,9 @@ export class RemoteSyncService {
       this.status.telemetry.last_build_reason = reason || (dryRun ? "preview" : force ? "forced" : reconcile ? "audit" : "configuration event");
       const snapshot = await this.syncCoordinator.buildSnapshot({ force: force || reconcile || dryRun, shouldAbort: () => !force && !dryRun && this.configurationRevision !== syncRevision });
       this.status.telemetry.builds += 1; Object.assign(this.status.telemetry, { last_build_ms: snapshot.metrics?.build_ms || null, last_compression_ms: snapshot.metrics?.compression_ms || null, last_payload_bytes: snapshot.metrics?.payload_bytes || snapshot.payload.length, last_uncompressed_bytes: snapshot.metrics?.uncompressed_bytes || null, last_resource_count: snapshot.metrics?.resource_count || 0 });
-      if (!dryRun && !force && snapshot.manifest.content_hash === this.status.last_snapshot_hash) {
+      const unchanged = snapshot.manifest.content_hash === this.status.last_snapshot_hash
+        || (snapshot.manifest.change_hash && snapshot.manifest.change_hash === this.status.last_change_hash);
+      if (!dryRun && !force && unchanged) {
         Object.assign(this.status, { pending_changes: this.configurationRevision !== syncRevision, state: "connected", last_sync_result: "No configuration changes" });
         this.#notify();
         return { success: true, changed: false, content_hash: snapshot.manifest.content_hash };
@@ -338,6 +357,22 @@ export class RemoteSyncService {
           totals.remove += Number(counts.remove || 0);
         }
         this.status.last_preview_at = now;
+        this.status.last_preview_details = {
+          generated_at: now,
+          totals,
+          peers: peers.map((peer) => {
+            const result = peerResults[peer.peer_id] || {};
+            return {
+              peer_id: peer.peer_id,
+              name: peer.name,
+              success: Boolean(result.success),
+              error: result.success ? null : (result.error || result.report?.error || null),
+              counts: result.preview?.counts || null,
+              sections: result.preview?.sections || null,
+              summary: result.preview?.summary || null
+            };
+          })
+        };
         this.status.last_preview_result = peers.length
           ? `Create ${totals.create}, update ${totals.update}, remove ${totals.remove} across ${peers.length} satellite(s)`
           : "No satellite peers configured";
@@ -364,6 +399,7 @@ export class RemoteSyncService {
       }
       if (success) {
         this.status.last_snapshot_hash = snapshot.manifest.content_hash;
+        this.status.last_change_hash = snapshot.manifest.change_hash || null;
         this.status.pending_changes = this.configurationRevision !== syncRevision;
         this.status.successful_syncs += 1;
         this.status.state = "connected";
@@ -466,6 +502,32 @@ export class RemoteSyncService {
     return { agent_token: nextToken };
   }
 
+  // Remove everything the paired Primary synchronized to this Satellite. Called by the Primary before it removes the
+  // Satellite.
+  async purgeSynchronized({ master_id, resources = [] }) {
+    if (!this.config || this.config.role !== "child") throw new Error("Only a satellite can remove synchronized configuration");
+    if (String(master_id || "") !== String(this.config.pairing?.paired_master_id || "")) throw new Error("Removal requested by a different primary");
+    if (this.applying) throw new Error("A snapshot is being applied; try again in a moment");
+    this.applying = true;
+    this.status.state = "removing synchronized configuration";
+    this.#notify();
+    try {
+      const purger = new SatellitePurger(this.client, this.mappings);
+      const report = await purger.purge(String(master_id), { proxyCatalog: this.proxyCatalog, resources });
+      this.virtualDockServer?.setDocks(String(master_id), []);
+      this.proxyStore.clear();
+      this.proxyCatalog = { schema_version: 2, entities: [], mapping: {}, activation_hash: null };
+      this.#notifyProxy();
+      this.status.last_snapshot_hash = null;
+      this.status.last_sync_result = `Removed ${report.removed} synchronized object(s)${report.remaining ? `; ${report.remaining} could not be removed` : ""}`;
+      return report;
+    } finally {
+      this.applying = false;
+      this.status.state = this.config?.pairing?.paired_master_id ? "paired" : "ready to pair";
+      this.#notify();
+    }
+  }
+
   async unpairSatellite({ master_id }) {
     if (!this.config || this.config.role !== "child") throw new Error("Only a satellite can be unpaired");
     if (String(master_id || "") !== String(this.config.pairing?.paired_master_id || "")) throw new Error("Unpairing requested by a different primary");
@@ -562,17 +624,36 @@ export class RemoteSyncService {
   async executeProxyCommand({ source_entity_id, cmd_id, params }) {
     if (!this.config || this.config.role !== "master" || !this.client) return { success: false, status: 409, error: "This node is not an active primary" };
     try {
+      const readiness = await this.#activityReadiness(source_entity_id, cmd_id);
       const response = await this.client.executeEntityCommand(source_entity_id, cmd_id, params);
       let entity = null;
       try {
         await sleep(100);
         entity = await this.client.getJson(`/entities/${encodeURIComponent(source_entity_id)}`, { optionalStatuses: [404] });
       } catch (error) { log.debug(`Could not refresh state after proxy command: ${error.message}`); }
-      return { success: true, status: 200, source_entity_id, cmd_id, response, entity };
+      return { success: true, status: 200, source_entity_id, cmd_id, response, entity, readiness };
     } catch (error) {
       log.warn(`Proxy command failed for ${source_entity_id}:${cmd_id}:`, error.message);
       return { success: false, status: error.status || 502, error: error.message, source_entity_id, cmd_id };
     }
+  }
+
+  // Pre-flight report for relayed activity commands. The check never gates the command (the Core runs the activity
+  // exactly as before); it surfaces devices that would not be reached so the satellite can show a useful reason.
+  async #activityReadiness(entityId, cmdId) {
+    const match = /^activity\.(on|off|start)$/.exec(String(cmdId || ""));
+    if (!match || typeof this.client?.activityReadiness !== "function") return null;
+    const report = await this.client.activityReadiness(entityId, match[1] === "start" ? "on" : match[1]);
+    if (!report || typeof report !== "object") return null;
+    const blocked = (Array.isArray(report.steps) ? report.steps : [])
+      .filter((step) => step && step.ready === false)
+      .map((step) => ({ entity_id: step.entity_id || step.target_entity_id || null, name: step.name || step.entity_name || null, reason: step.reason || null }))
+      .slice(0, 20);
+    const summary = { ready: report.ready !== false, blocked_steps: Number(report.blocked_steps ?? blocked.length) || 0, aborting_steps: Number(report.aborting_steps || 0), blocked };
+    if (!summary.ready || summary.blocked_steps) {
+      log.warn(`Activity ${entityId} ${match[1]} readiness: ${summary.ready ? "ready" : "not ready"}, ${summary.blocked_steps} blocked step(s)`, blocked.map((step) => `${step.name || step.entity_id}: ${step.reason || "blocked"}`).join("; "));
+    }
+    return summary;
   }
 
   async #postProxyCommand(url, token, sourceEntityId, cmdId, params) {
@@ -651,6 +732,374 @@ export class RemoteSyncService {
     } catch (error) { this.status.state = `unreachable: ${error.message}`; this.#notify(); return { success: false, error: error.message }; }
   }
 
+  // -------------------------------------------------------------------------
+  // Remote information, PIN verification and dashboard operations
+  // -------------------------------------------------------------------------
+
+  setRemoteInfo(info) {
+    this.remoteInfo = info || null;
+  }
+
+  // Verify a Core API key presented by a Primary during IP + PIN pairing. The key must be an admin key of this
+  // remote's own Core, which only someone holding the Web Configurator PIN can create. An unassigned installation
+  // becomes a Satellite at this point.
+  async verifyCoreKey(coreKey) {
+    if (!this.config || !["child", "unassigned"].includes(this.config.role)) return false;
+    const client = new CoreClient({ ...this.config.remote, api_key: String(coreKey), mac: null, broadcasts: [] }, { requestTimeoutMs: 5000 });
+    try {
+      await client.getJson("/auth/api_keys", { params: { limit: 1 }, wakeOnUnavailable: false });
+      return true;
+    } catch (error) {
+      if (!(error instanceof CoreApiError) || ![401, 403].includes(error.status)) log.warn("PIN pairing key verification failed:", error.message);
+      return false;
+    } finally {
+      await client.close();
+    }
+  }
+
+  async pinPair(coreKey) {
+    if (!await this.verifyCoreKey(coreKey)) return null;
+    log.info("PIN pairing request verified against this remote's Core");
+    if (this.config.role === "unassigned") {
+      const saved = this.#assignRoleNow("child");
+      return { agent_token: saved.agent_token, role: "child", identifier: saved.pairing_identifier, ready_to_pair: true, assigned: true };
+    }
+    return { agent_token: this.config.agent_token };
+  }
+
+  // -------------------------------------------------------------------------
+  // Role and settings (configured in the web dashboard)
+  // -------------------------------------------------------------------------
+
+  #assignRoleNow(role, { name = null } = {}) {
+    if (!this.config) throw new Error("Remote Sync is not set up; run the integration setup with the PIN first");
+    if (!["master", "child"].includes(role)) throw new Error("role must be primary or satellite");
+    const next = structuredClone(this.config);
+    next.role = role;
+    if (name) next.node_name = String(name).trim().slice(0, 64) || next.node_name;
+    next.peers = role === "master" ? (next.peers || []) : [];
+    next.pairing = { ready_to_pair: role === "child", paired_master_id: null, paired_master_name: null, paired_at: null, master_agent_url: null, master_command_token: null, master_mac: null, master_broadcasts: [] };
+    if (role === "child") {
+      next.pairing_identifier = isPairingIdentifier(next.pairing_identifier) ? next.pairing_identifier : generatePairingIdentifier();
+      next.sync = { ...next.sync, auto_sync: false };
+    } else {
+      next.pairing_identifier = null;
+      const hasDockToken = Boolean(next.physical_docks?.default_token || Object.keys(next.physical_docks?.tokens || {}).length);
+      const sections = (next.sync?.sections || DEFAULT_SECTIONS).filter((section) => hasDockToken || section !== "docks");
+      next.sync = { ...next.sync, sections: sections.length ? sections : DEFAULT_SECTIONS.filter((section) => section !== "docks"), auto_sync: true };
+    }
+    const saved = this.store.save(next);
+    log.info(`Role set to ${role === "master" ? "Primary" : "Satellite"}`);
+    this.#deferReconfigure(saved);
+    return saved;
+  }
+
+  async assignRole(role, options = {}) {
+    if (this.config?.role !== "unassigned") throw new Error("A role is already set. Reset the role in Settings first.");
+    const normalized = role === "primary" ? "master" : role === "satellite" ? "child" : role;
+    const saved = this.#assignRoleNow(normalized, options);
+    return { success: true, role: saved.role === "master" ? "primary" : "satellite" };
+  }
+
+  async resetRole() {
+    if (!this.config || this.config.role === "unassigned") throw new Error("No role is set");
+    if (this.config.role === "child" && this.config.pairing?.paired_master_id) {
+      log.warn(`Resetting a Satellite that is paired with ${this.config.pairing.paired_master_name || this.config.pairing.paired_master_id}`);
+    }
+    const next = structuredClone(this.config);
+    next.role = "unassigned";
+    next.peers = [];
+    next.pairing_identifier = null;
+    next.pairing = { ready_to_pair: false };
+    next.agent_token = secureToken();
+    const saved = this.store.save(next);
+    this.proxyStore.clear();
+    this.#deferReconfigure(saved);
+    return { success: true };
+  }
+
+  generalSettings() {
+    if (!this.config) return null;
+    const docks = this.config.physical_docks || {};
+    return {
+      role: this.config.role === "master" ? "primary" : this.config.role === "child" ? "satellite" : "unassigned",
+      node_name: this.config.node_name,
+      agent_public_url: this.config.agent_public_url || "",
+      remote: { host: this.config.remote.host, port: this.config.remote.port || null, scheme: this.config.remote.scheme },
+      network: {
+        interface: this.config.remote.interface || null,
+        mac: this.config.remote.mac || null,
+        broadcasts: this.config.remote.broadcasts || [],
+        source: this.config.remote.network_source || null,
+        mac_override: this.config.network_overrides?.mac || "",
+        broadcast_overrides: (this.config.network_overrides?.broadcasts || []).join(", ")
+      },
+      docks: { default_token_set: Boolean(docks.default_token), dock_ids: Object.keys(docks.tokens || {}) },
+      sync: this.syncSettings()
+    };
+  }
+
+  async updateGeneralSettings(patch = {}) {
+    if (!this.config) throw new Error("Remote Sync is not set up");
+    const next = structuredClone(this.config);
+    if (patch.node_name !== undefined) {
+      const name = String(patch.node_name || "").trim();
+      if (!name) throw new Error("The name cannot be empty");
+      next.node_name = name.slice(0, 64);
+    }
+    if (patch.agent_public_url !== undefined) next.agent_public_url = String(patch.agent_public_url || "").trim() || null;
+    if (patch.dock_tokens !== undefined && String(patch.dock_tokens).trim()) {
+      next.physical_docks = physicalDockTokens(patch.dock_tokens, next.physical_docks);
+    }
+    if (patch.clear_dock_tokens === true) next.physical_docks = { default_token: "", tokens: {} };
+    let redetect = false;
+    if (patch.mac_override !== undefined || patch.broadcast_overrides !== undefined) {
+      const overrides = networkOverrides({
+        network_mac_override: patch.mac_override ?? next.network_overrides?.mac ?? "",
+        network_broadcast_overrides: patch.broadcast_overrides ?? (next.network_overrides?.broadcasts || []).join(",")
+      });
+      next.network_overrides = overrides;
+      redetect = true;
+    }
+    if (redetect) {
+      const network = await detectRemoteNetworkIdentity({
+        host: next.remote.host,
+        fallbackMac: next.remote.mac,
+        fallbackBroadcasts: next.remote.broadcasts,
+        macOverride: next.network_overrides.mac,
+        broadcastsOverride: next.network_overrides.broadcasts,
+        preferWireless: true
+      });
+      Object.assign(next.remote, { mac: network.mac, broadcasts: network.broadcasts, interface: network.interface, network_source: network.source });
+    }
+    const saved = this.store.save(next);
+    this.#deferReconfigure(saved);
+    return { success: true, settings: { ...this.generalSettings(), node_name: saved.node_name } };
+  }
+
+  async discoverSatellites() {
+    if (this.config?.role !== "master") return [];
+    const paired = new Set((this.config.peers || []).map((peer) => normalizePairingIdentifier(peer.identifier)));
+    let found = [];
+    try { found = await this.discovery.discoverReady(); }
+    catch (error) { log.warn("Satellite discovery failed:", error.message); }
+    return found
+      .filter((item) => !paired.has(normalizePairingIdentifier(item.identifier)))
+      .map((item) => ({ identifier: item.identifier, name: item.name || item.identifier, address: item.address || item.hostname || null, url: item.url || null, version: item.version || item.protocol?.version || null }));
+  }
+
+  async addSatelliteByToken({ address, port = null, token, name = null } = {}) {
+    if (!this.config || this.config.role !== "master") throw new Error("Satellites can only be added on a Primary");
+    const config = this.config;
+    const requiredCapabilities = ["proxy_entities"];
+    if (config.sync.sections.includes("docks")) requiredCapabilities.push("dock_tunnel");
+    try {
+      const satellite = await inspectManualSatellite({
+        address, port, token, name,
+        masterId: config.node_id,
+        masterName: config.node_name,
+        requiredCapabilities,
+        existingPeers: config.peers
+      });
+      const peer = await this.#claimSatellite(satellite, String(token).trim(), {});
+      return { success: true, peer_id: peer.peer_id, name: peer.name };
+    } catch (error) {
+      log.warn("Adding a Satellite by token failed:", error.message);
+      return { success: false, error: error.message };
+    }
+  }
+
+  async #claimSatellite(satellite, token, management) {
+    const config = this.config;
+    const peerId = `rms-${normalizePairingIdentifier(satellite.identifier).toLowerCase()}`;
+    const existing = config.peers.find((peer) => peer.peer_id === peerId) || null;
+    const commandToken = existing?.command_token || secureToken();
+    const client = new PeerAgentClient(satellite.url, token);
+    const claimed = await client.claim({
+      master_id: config.node_id,
+      master_name: config.node_name,
+      master_agent_url: reachableAgentUrl(config),
+      master_command_token: commandToken,
+      master_mac: config.remote.mac || null,
+      master_broadcasts: config.remote.broadcasts || []
+    });
+    const next = structuredClone(config);
+    const peer = {
+      peer_id: peerId,
+      identifier: satellite.identifier,
+      name: satellite.name,
+      url: satellite.url,
+      token,
+      mac: claimed.mac || satellite.mac || existing?.mac || null,
+      broadcasts: claimed.broadcasts?.length ? claimed.broadcasts : (satellite.broadcasts || []),
+      enabled: true,
+      child_node_id: claimed.node_id || satellite.node_id || null,
+      claimed_at: claimed.paired_at || utcNow(),
+      command_token: commandToken,
+      protocol: satellite.protocol || null,
+      core_api_key: management.coreApiKey || existing?.core_api_key || null,
+      core_key_name: management.coreKeyName || (management.coreApiKey ? null : existing?.core_key_name) || null,
+      core_host: management.host || existing?.core_host || null,
+      core_scheme: management.scheme || existing?.core_scheme || null,
+      core_port: management.port || existing?.core_port || null
+    };
+    // Re-adding a managed Satellite creates a new management key; revoke the previous one.
+    if (management.coreApiKey && existing?.core_key_name && existing.core_key_name !== management.coreKeyName) {
+      revokeManagementKey(existing, { resolvedUrl: satellite.url }).catch(() => {});
+    }
+    const index = next.peers.findIndex((item) => item.peer_id === peerId);
+    if (index >= 0) next.peers[index] = { ...next.peers[index], ...peer };
+    else next.peers.push(peer);
+    const saved = this.store.save(next);
+    this.#deferReconfigure(saved);
+    return peer;
+  }
+
+  async verifyUiPin(pin) {
+    if (!this.config) return false;
+    const remote = this.config.remote;
+    return CoreClient.verifyWebConfiguratorPin(remote.host, pin, { scheme: remote.scheme, port: remote.port });
+  }
+
+  async wakeOnWlanState() {
+    if (!this.client) return null;
+    try { return await this.client.wakeOnWlan(); } catch { return null; }
+  }
+
+  async enableWakeOnWlan() {
+    if (!this.client) throw new Error("Remote Sync is not configured");
+    await this.client.setWakeOnWlan(true);
+    return { success: true, wake_on_wlan: await this.wakeOnWlanState() };
+  }
+
+  syncSettings() {
+    if (!this.config) return null;
+    return { ...structuredClone(this.config.sync), available_sections: [...DEFAULT_SECTIONS] };
+  }
+
+  async updateSyncSettings(patch = {}) {
+    if (!this.config || this.config.role !== "master") throw new Error("Settings can only be changed on a configured Primary");
+    const next = structuredClone(this.config);
+    const sync = next.sync;
+    if (patch.sections !== undefined) {
+      if (!Array.isArray(patch.sections)) throw new Error("sections must be a list");
+      sync.sections = DEFAULT_SECTIONS.filter((section) => patch.sections.includes(section));
+      if (!sync.sections.length) throw new Error("Enable at least one synchronization section");
+      if (sync.sections.includes("docks") && !next.physical_docks?.default_token && !Object.keys(next.physical_docks?.tokens || {}).length) {
+        throw new Error("Dock synchronization needs a physical Dock API token; set it in the integration setup first");
+      }
+    }
+    if (patch.interval_seconds !== undefined) {
+      const interval = Number(patch.interval_seconds);
+      if (!Number.isFinite(interval) || interval < 300 || interval > 86_400) throw new Error("The interval must be between 300 and 86400 seconds");
+      sync.interval_seconds = Math.round(interval);
+    }
+    for (const key of ["auto_sync", "prune", "use_standby_inhibitor", "verify_existing_resource_hashes", "auto_update_satellites"]) {
+      if (patch[key] !== undefined) sync[key] = Boolean(patch[key]);
+    }
+    const saved = this.store.save(next);
+    this.#deferReconfigure(saved);
+    return { success: true, sync: saved.sync };
+  }
+
+  #deferReconfigure(config) {
+    // Dashboard requests are served by the agent server that configure() restarts, so answer first. The saved
+    // configuration becomes current at once so a following change in the same request builds on it.
+    this.config = config;
+    clearTimeout(this.reconfigureTimer);
+    this.reconfigureTimer = setTimeout(() => {
+      this.reconfigureTimer = null;
+      this.configure(this.config).catch((error) => log.error("Reconfiguration failed:", error));
+    }, 250);
+    this.reconfigureTimer.unref?.();
+  }
+
+  provisioningStatus() {
+    return [...this.provisioning.values()];
+  }
+
+  async addSatelliteByPin({ address, pin, name = null, install = true, httpPort = null, agentPort = null } = {}) {
+    if (!this.config || this.config.role !== "master") throw new Error("Satellites can only be added on a configured Primary");
+    const key = String(address || "").trim().toLowerCase();
+    if (!key) throw new Error("Enter the Satellite address");
+    if (this.provisioning.has(key) && this.provisioning.get(key).state === "running") throw new Error("This Satellite is already being added");
+    const job = { address: key, state: "running", started_at: utcNow(), steps: [], error: null, peer_id: null };
+    this.provisioning.set(key, job);
+    this.#notify();
+    const progress = (message) => { job.steps.push({ at: utcNow(), message }); log.info(`[${key}] ${message}`); this.#notify(); };
+    try {
+      const config = this.config;
+      const provisioned = await provisionSatelliteByPin({ address, pin, install, httpPort, agentPort, primaryName: config.node_name, onProgress: progress });
+      const requiredCapabilities = ["proxy_entities"];
+      if (config.sync.sections.includes("docks")) requiredCapabilities.push("dock_tunnel");
+      const satellite = await inspectManualSatellite({
+        address: provisioned.agentUrl,
+        token: provisioned.token,
+        name: name || provisioned.deviceName,
+        masterId: config.node_id,
+        masterName: config.node_name,
+        requiredCapabilities,
+        existingPeers: config.peers
+      });
+      progress("Claiming the Satellite");
+      const peer = await this.#claimSatellite(satellite, provisioned.token, provisioned);
+      const peerId = peer.peer_id;
+      Object.assign(job, { state: "done", peer_id: peerId, finished_at: utcNow(), installation: provisioned.installation, wake_on_wlan: provisioned.wakeOnWlan });
+      progress(`Added ${peer.name}`);
+      return { success: true, peer_id: peerId, name: peer.name, installation: provisioned.installation, wake_on_wlan: provisioned.wakeOnWlan };
+    } catch (error) {
+      Object.assign(job, { state: "error", error: error.message, finished_at: utcNow() });
+      log.warn(`Adding Satellite ${key} failed:`, error.message);
+      this.#notify();
+      return { success: false, error: error.message };
+    }
+  }
+
+  // Read-only data for the dashboard's Remote UI preview: what a Satellite will show after the next synchronization,
+  // taken from the Primary's latest snapshot (built by a preview or synchronization).
+  simulatorModel() {
+    const snapshot = this.syncCoordinator.cachedSnapshot();
+    const manifest = snapshot?.manifest;
+    if (!manifest) return { available: false };
+    const data = manifest.data || {};
+    const strip = (value) => {
+      if (!value || typeof value !== "object") return value;
+      const copy = { ...value };
+      delete copy.integration_id;
+      return copy;
+    };
+    const internal = (records, type) => (records || []).map((record) => ({ ...strip(record.detail || {}), entity_id: String(record.source_id), entity_type: type }));
+    const profiles = (data.profiles?.items || []).map((record) => ({
+      profile_id: String(record.source_id),
+      name: record.detail?.name || record.source_id,
+      icon: record.detail?.icon || null,
+      pages: record.pages || [],
+      groups: record.groups || []
+    }));
+    const active = data.profiles?.active;
+    return {
+      available: true,
+      generated_at: manifest.created_at,
+      source_name: manifest.source_name,
+      sections: manifest.sections,
+      active_profile_id: String(active?.profile_id || active?.id || active?.profile?.profile_id || profiles[0]?.profile_id || ""),
+      profiles,
+      entities: (data.entities || []).map(strip),
+      activities: internal(data.activities, "activity"),
+      macros: internal(data.macros, "macro"),
+      remotes: internal(data.remotes, "remote")
+    };
+  }
+
+  async primaryResource(type, id) {
+    if (!this.client || this.config?.role !== "master") throw new Error("Resources are only available on a Primary");
+    return this.client.bytes("GET", `/resources/${encodeURIComponent(type)}/${encodeURIComponent(id)}`, { expected: [200], timeoutMs: 15_000, wakeOnUnavailable: false });
+  }
+
+  async removeSatellite(peerId) {
+    return this.satelliteManager.action(peerId, "remove");
+  }
+
   statusPayload() {
     return {
       configured: Boolean(this.config),
@@ -660,7 +1109,10 @@ export class RemoteSyncService {
       proxy_count: this.proxyCatalog?.entities?.length || 0,
       satellites: this.config?.role === "master" ? this.satelliteManager.list() : [],
       virtual_docks: this.virtualDockServer?.status() || null,
-      dock_tunnels: this.dockTunnelSessions.size
+      dock_tunnels: this.dockTunnelSessions.size,
+      version: APP_VERSION,
+      remote: this.remoteInfo?.version ? { api: this.remoteInfo.version.api || null, core: this.remoteInfo.version.core || null, model: this.remoteInfo.version.model || null } : null,
+      runtime: this.remoteInfo?.runtime || null
     };
   }
   get agentUrl() {

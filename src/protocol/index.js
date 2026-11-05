@@ -17,7 +17,10 @@ export const CAPABILITIES = Object.freeze([
   "automatic_network_identity",
   "satellite_management",
   "credential_rotation",
-  "sync_preview"
+  "sync_preview",
+  "pin_pairing",
+  "remote_install",
+  "purge_on_remove"
 ]);
 
 export function protocolDescriptor(extra = {}) {

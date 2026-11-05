@@ -3,6 +3,7 @@ import os from "node:os";
 import { EventEmitter } from "node:events";
 import { createWebSocketHttpServer } from "../transport/websocket.js";
 import { logger } from "../shared/logger.js";
+import { versionAtLeast } from "../shared/util.js";
 
 const log = logger("integration-api");
 
@@ -13,28 +14,76 @@ const log = logger("integration-api");
 export const DeviceStates = Object.freeze({ Connected: "CONNECTED", Connecting: "CONNECTING", Disconnected: "DISCONNECTED", Error: "ERROR" });
 export const StatusCodes = Object.freeze({ Ok: 200, BadRequest: 400, Unauthorized: 401, NotFound: 404, Timeout: 408, Conflict: 409, ServerError: 500, NotImplemented: 501, ServiceUnavailable: 503 });
 export const Events = Object.freeze({ SubscribeEntities: "subscribe_entities", UnsubscribeEntities: "unsubscribe_entities", Connect: "connect", Disconnect: "disconnect", EnterStandby: "enter_standby", ExitStandby: "exit_standby", SetupDriverAbort: "setup_driver_abort" });
-export const IntegrationSetupError = Object.freeze({ None: "NONE", NotFound: "NOT_FOUND", ConnectionRefused: "CONNECTION_REFUSED", AuthorizationError: "AUTHORIZATION_ERROR", Timeout: "TIMEOUT", Other: "OTHER" });
+export const IntegrationSetupError = Object.freeze({
+  None: "NONE", NotFound: "NOT_FOUND", ConnectionRefused: "CONNECTION_REFUSED", AuthorizationError: "AUTHORIZATION_ERROR", Timeout: "TIMEOUT", Other: "OTHER",
+  // Remote API 0.19.0 and newer.
+  DriverUnavailable: "DRIVER_UNAVAILABLE", InvalidInput: "INVALID_INPUT", Aborted: "ABORTED", AlreadyConfigured: "ALREADY_CONFIGURED", NotSupported: "NOT_SUPPORTED"
+});
+const LEGACY_SETUP_ERRORS = new Set(["NONE", "NOT_FOUND", "CONNECTION_REFUSED", "AUTHORIZATION_ERROR", "TIMEOUT", "OTHER"]);
+// Remote API version that introduced in-place input correction, `error_message`, the setup `language` field and
+// keep-alive based setup sessions.
+export const SETUP_V2_API_VERSION = "0.19.0";
+const LEGACY_PROGRESS_INTERVAL_MS = 5000;
 export const SensorStates = Object.freeze({ Unavailable: "UNAVAILABLE", Unknown: "UNKNOWN", On: "ON" });
 export const SensorAttributes = Object.freeze({ State: "state", Value: "value", Unit: "unit" });
 export const SensorDeviceClasses = Object.freeze({ Custom: "custom" });
 export const ButtonStates = Object.freeze({ Unavailable: "UNAVAILABLE", Available: "AVAILABLE" });
+export const SelectStates = Object.freeze({ Unavailable: "UNAVAILABLE", Unknown: "UNKNOWN", On: "ON" });
+export const SelectAttributes = Object.freeze({ State: "state", CurrentOption: "current_option", Options: "options" });
 
 // -----------------------------------------------------------------------------
 // Setup messages
 // -----------------------------------------------------------------------------
 
 export class SetupDriver {}
-export class DriverSetupRequest extends SetupDriver { constructor(reconfigure, setupData) { super(); this.reconfigure = Boolean(reconfigure); this.setupData = setupData || {}; } }
+export class DriverSetupRequest extends SetupDriver { constructor(reconfigure, setupData, language = null) { super(); this.reconfigure = Boolean(reconfigure); this.setupData = setupData || {}; this.language = language || null; } }
 export class UserDataResponse extends SetupDriver { constructor(inputValues) { super(); this.inputValues = inputValues || {}; } }
 export class UserConfirmationResponse extends SetupDriver { constructor(confirm) { super(); this.confirm = Boolean(confirm); } }
 export class AbortDriverSetup extends SetupDriver { constructor(error) { super(); this.error = error; } }
 export class SetupAction {}
-export class RequestUserInput extends SetupAction { constructor(title, settings) { super(); this.title = title; this.settings = settings; } }
+export class RequestUserInput extends SetupAction {
+  // `errorMessage` marks the page as a correction request for rejected input. Remotes with API 0.19.0+ show it as
+  // `INVALID_INPUT` with the page; older Remotes get it as a label at the top of the page instead.
+  constructor(title, settings, { errorMessage = null } = {}) { super(); this.title = title; this.settings = settings; this.errorMessage = errorMessage || null; }
+}
 export class RequestUserConfirmation extends SetupAction { constructor(title, header, image, footer) { super(); this.title = title; this.header = header; this.image = image; this.footer = footer; } }
-export class SetupError extends SetupAction { constructor(errorType = IntegrationSetupError.Other) { super(); this.errorType = errorType; } }
+export class SetupError extends SetupAction { constructor(errorType = IntegrationSetupError.Other, errorMessage = null) { super(); this.errorType = errorType; this.errorMessage = errorMessage || null; } }
 export class SetupComplete extends SetupAction {}
 
 function language(value) { return typeof value === "string" ? { en: value } : value; }
+
+// Narrow a language object to the requested UI language (plus `en` as fallback). Languages are given as
+// e.g. `de_DE`; texts are keyed by language (`de`) or full code (`de_DE`).
+export function localize(value, requested = null) {
+  const text = language(value);
+  if (!requested || !text || typeof text !== "object") return text;
+  const full = String(requested);
+  const short = full.split(/[_-]/)[0];
+  const key = text[full] !== undefined ? full : (text[short] !== undefined ? short : null);
+  if (!key) return text;
+  const result = { [key]: text[key] };
+  if (text.en !== undefined && short !== "en") result.en = text.en;
+  return result;
+}
+
+function localizeSettings(settings, requested) {
+  if (!requested) return settings;
+  return (settings || []).map((item) => {
+    const next = { ...item, label: localize(item.label, requested) };
+    if (item.description) next.description = localize(item.description, requested);
+    if (item.field?.label?.value) next.field = { label: { value: localize(item.field.label.value, requested) } };
+    if (item.field?.number?.unit) next.field = { number: { ...item.field.number, unit: localize(item.field.number.unit, requested) } };
+    if (item.field?.dropdown?.items) next.field = { dropdown: { ...item.field.dropdown, items: item.field.dropdown.items.map((entry) => ({ ...entry, label: localize(entry.label, requested) })) } };
+    return next;
+  });
+}
+
+export function messageText(value, requested = null) {
+  const text = localize(value, requested);
+  if (typeof text === "string") return text;
+  if (!text || typeof text !== "object") return "";
+  return text[requested] ?? text[String(requested || "").split(/[_-]/)[0]] ?? text.en ?? Object.values(text)[0] ?? "";
+}
 
 // -----------------------------------------------------------------------------
 // Entity models
@@ -67,6 +116,19 @@ export class Sensor extends Entity {
 }
 export class Button extends Entity {
   constructor(id, name, { icon, description, state = ButtonStates.Available, area, cmdHandler } = {}) { super(id, name, "button", { icon, description, features: ["press"], attributes: { state }, area, cmdHandler }); }
+}
+
+export class Select extends Entity {
+  constructor(id, name, { icon, description, options = [], currentOption = null, state = SelectStates.On, area, cmdHandler } = {}) {
+    super(id, name, "select", {
+      icon,
+      description,
+      features: [],
+      attributes: { [SelectAttributes.State]: state, [SelectAttributes.Options]: [...options], [SelectAttributes.CurrentOption]: currentOption ?? "" },
+      area,
+      cmdHandler
+    });
+  }
 }
 
 class EntityStore {
@@ -199,7 +261,16 @@ export class IntegrationAPI extends EventEmitter {
     this.configuredEntities = new EntityStore((entity, attrs) => this.#broadcast("entity_change", { entity_id: entity.id, entity_type: entity.entity_type, attributes: attrs }, "ENTITY"));
     this.wsServer = null;
     this.mdns = null;
+    this.remoteVersion = null;
+    this.runtimeInfo = null;
+    this.setupLanguage = null;
+    this.setupV2 = false;
+    this.outgoingId = 1;
+    this.outgoing = new Map();
   }
+
+  // True when the connected Remote supports in-place input correction, `error_message` and keep-alive based setup.
+  get supportsSetupV2() { return this.setupV2 || versionAtLeast(this.remoteVersion?.api, SETUP_V2_API_VERSION); }
 
   async init(driverConfig, setupHandler = null) {
     this.setupHandler = setupHandler;
@@ -221,6 +292,47 @@ export class IntegrationAPI extends EventEmitter {
       try { client.close(); } catch {}
     }
   }
+  // Driver → Remote requests (`get_version`, `get_runtime_info`) over the first connected Remote session.
+  async requestRemote(msg, msgData = undefined, timeoutMs = 5000, peer = null) {
+    const target = peer || [...this.clients][0];
+    if (!target) throw new Error("No Remote is connected to the integration driver");
+    const id = this.outgoingId++;
+    const payload = { kind: "req", id, msg };
+    if (msgData !== undefined) payload.msg_data = msgData;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { this.outgoing.delete(id); reject(new Error(`Remote did not answer ${msg}`)); }, timeoutMs);
+      timer.unref?.();
+      this.outgoing.set(id, { resolve, reject, timer, msg });
+      this.#send(target, payload);
+    });
+  }
+
+  async getRemoteVersion(peer = null) {
+    const response = await this.requestRemote("get_version", undefined, 5000, peer);
+    if (response?.code && (response.code < 200 || response.code >= 300)) throw new Error(`get_version returned ${response.code}`);
+    this.remoteVersion = response?.msg_data && typeof response.msg_data === "object" ? response.msg_data : null;
+    return this.remoteVersion;
+  }
+
+  async getRuntimeInfo(peer = null) {
+    const response = await this.requestRemote("get_runtime_info", undefined, 5000, peer);
+    if (response?.code && (response.code < 200 || response.code >= 300)) throw new Error(`get_runtime_info returned ${response.code}`);
+    this.runtimeInfo = response?.msg_data && typeof response.msg_data === "object" ? response.msg_data : null;
+    return this.runtimeInfo;
+  }
+
+  async #discoverRemote(peer) {
+    try {
+      const version = await this.getRemoteVersion(peer);
+      log.info(`Connected Remote API ${version?.api || "unknown"} (core ${version?.core || "unknown"})`);
+    } catch (error) { log.debug("Remote version request failed:", error.message); }
+    try {
+      const info = await this.getRuntimeInfo(peer);
+      log.info(`Runtime info: driver ${info?.driver_id || "unknown"}, instances ${(info?.intg_ids || []).join(", ") || "none"}`);
+    } catch (error) { log.debug("Runtime info is unavailable on this Remote:", error.message); }
+    this.emit("remote_info", { version: this.remoteVersion, runtime: this.runtimeInfo, address: peer.remoteAddress || null });
+  }
+
   getAvailableEntities() { return this.availableEntities; }
   getConfiguredEntities() { return this.configuredEntities; }
   addAvailableEntity(entity) { return this.availableEntities.addAvailableEntity(entity); }
@@ -234,10 +346,12 @@ export class IntegrationAPI extends EventEmitter {
 
   #connection(peer) {
     this.clients.add(peer);
+    this.lastRemoteAddress = peer.remoteAddress || this.lastRemoteAddress || null;
     peer.on("message", (raw) => this.#message(peer, raw.toString()).catch((error) => log.error("Integration message failed:", error)));
     peer.on("close", () => this.clients.delete(peer));
     peer.on("error", (error) => { log.warn("Integration WebSocket error:", error.message); this.clients.delete(peer); });
     this.#response(peer, 0, "authentication", {}, StatusCodes.Ok);
+    setTimeout(() => this.#discoverRemote(peer), 250).unref?.();
   }
   #send(peer, value) { try { peer.send(JSON.stringify(value)); } catch (error) { log.warn("Integration response failed:", error.message); } }
   #response(peer, reqId, msg, msgData = {}, code = 200) { this.#send(peer, { kind: "resp", req_id: reqId, msg, code, msg_data: msgData }); }
@@ -251,6 +365,11 @@ export class IntegrationAPI extends EventEmitter {
       const mapping = { connect: Events.Connect, disconnect: Events.Disconnect, enter_standby: Events.EnterStandby, exit_standby: Events.ExitStandby, abort_driver_setup: Events.SetupDriverAbort };
       const event = mapping[value.msg]; if (event) this.emit(event, value.msg_data);
       if (value.msg === "abort_driver_setup" && this.setupHandler) await this.setupHandler(new AbortDriverSetup(value.msg_data?.error));
+      return;
+    }
+    if (value.kind === "resp") {
+      const pending = this.outgoing.get(value.req_id ?? value.id);
+      if (pending) { clearTimeout(pending.timer); this.outgoing.delete(value.req_id ?? value.id); pending.resolve(value); }
       return;
     }
     if (value.kind !== "req") return;
@@ -283,8 +402,11 @@ export class IntegrationAPI extends EventEmitter {
         break;
       }
       case "setup_driver": {
-        log.info(`Setup request received (reconfigure=${Boolean(data.reconfigure)})`);
-        await this.#setup(peer, id, new DriverSetupRequest(Boolean(data.reconfigure), data.setup_data || {}));
+        log.info(`Setup request received (reconfigure=${Boolean(data.reconfigure)}${data.language ? `, language=${data.language}` : ""})`);
+        // Only Remotes with API 0.19.0+ send `language`, which also signals support for the newer setup features.
+        this.setupLanguage = data.language || null;
+        this.setupV2 = Boolean(data.language);
+        await this.#setup(peer, id, new DriverSetupRequest(Boolean(data.reconfigure), data.setup_data || {}, data.language || null));
         break;
       }
       case "set_driver_user_data": {
@@ -304,19 +426,46 @@ export class IntegrationAPI extends EventEmitter {
   async #setup(peer, id, message, acknowledge = true, emitProgressForAction = true) {
     if (acknowledge) this.#response(peer, id, "result");
     if (!this.setupHandler) { this.#setupEvent(peer, "STOP", "ERROR", { error: IntegrationSetupError.Other }); return; }
+    // Remotes before API 0.19.0 abort a setup after 60 seconds without progress events. Slow steps (discovery,
+    // API-key approval, satellite installation) therefore keep sending progress events on those Remotes.
+    const progress = this.supportsSetupV2 ? null : setInterval(() => this.#setupEvent(peer, "SETUP", "SETUP"), LEGACY_PROGRESS_INTERVAL_MS);
+    progress?.unref?.();
+    const lang = this.setupLanguage;
     try {
       const action = await this.setupHandler(message);
+      if (progress) clearInterval(progress);
       log.info(`Setup action: ${action?.constructor?.name || "unknown"}`);
       if (action instanceof RequestUserInput) {
         if (emitProgressForAction) this.#setupEvent(peer, "SETUP", "SETUP");
-        this.#setupEvent(peer, "SETUP", "WAIT_USER_ACTION", { require_user_action: { input: { title: language(action.title), settings: action.settings } } });
+        let settings = localizeSettings(action.settings, lang);
+        const extra = {};
+        if (action.errorMessage) {
+          if (this.supportsSetupV2) {
+            extra.error = IntegrationSetupError.InvalidInput;
+            extra.error_message = localize(action.errorMessage, lang);
+          } else {
+            settings = [{ id: "error", label: localize({ en: "Setup error", de: "Einrichtungsfehler" }, lang), field: { label: { value: localize(action.errorMessage, lang) } } }, ...settings];
+          }
+        }
+        this.#setupEvent(peer, "SETUP", "WAIT_USER_ACTION", { ...extra, require_user_action: { input: { title: localize(action.title, lang), settings } } });
       } else if (action instanceof RequestUserConfirmation) {
         if (emitProgressForAction) this.#setupEvent(peer, "SETUP", "SETUP");
-        this.#setupEvent(peer, "SETUP", "WAIT_USER_ACTION", { require_user_action: { confirmation: { title: language(action.title), message1: action.header ? language(action.header) : undefined, image: action.image, message2: action.footer ? language(action.footer) : undefined } } });
+        this.#setupEvent(peer, "SETUP", "WAIT_USER_ACTION", { require_user_action: { confirmation: { title: localize(action.title, lang), message1: action.header ? localize(action.header, lang) : undefined, image: action.image, message2: action.footer ? localize(action.footer, lang) : undefined } } });
       } else if (action instanceof SetupComplete) this.#setupEvent(peer, "STOP", "OK");
-      else if (action instanceof SetupError) this.#setupEvent(peer, "STOP", "ERROR", { error: action.errorType });
+      else if (action instanceof SetupError) this.#setupEvent(peer, "STOP", "ERROR", this.#errorPayload(action.errorType, action.errorMessage, lang));
       else this.#setupEvent(peer, "STOP", "ERROR", { error: IntegrationSetupError.Other });
-    } catch (error) { log.error("Setup handler failed:", error); this.#setupEvent(peer, "STOP", "ERROR", { error: IntegrationSetupError.Other }); }
+    } catch (error) {
+      log.error("Setup handler failed:", error);
+      this.#setupEvent(peer, "STOP", "ERROR", this.#errorPayload(IntegrationSetupError.Other, error.message, lang));
+    } finally {
+      if (progress) clearInterval(progress);
+    }
+  }
+  #errorPayload(errorType, errorMessage, lang) {
+    if (!this.supportsSetupV2) return { error: LEGACY_SETUP_ERRORS.has(errorType) ? errorType : IntegrationSetupError.Other };
+    const payload = { error: errorType || IntegrationSetupError.Other };
+    if (errorMessage) payload.error_message = localize(errorMessage, lang);
+    return payload;
   }
   #setupEvent(peer, eventType, state, extra = {}) { this.#event(peer, "driver_setup_change", { event_type: eventType, state, ...extra }, "DEVICE"); }
 }

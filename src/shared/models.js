@@ -32,6 +32,7 @@ export function redactConfig(config) {
   for (const peer of copy.peers) {
     peer.token = "***";
     if (peer.command_token) peer.command_token = "***";
+    if (peer.core_api_key) peer.core_api_key = "***";
   }
   if (copy.pairing?.master_command_token) copy.pairing.master_command_token = "***";
   return copy;

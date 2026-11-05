@@ -1,8 +1,9 @@
+import crypto from "node:crypto";
 import { BAD_INTEGRATION_STATES, REQUEST_TIMEOUT_MS, WAKE_RETRY_SCHEDULE_MS, WAKE_TIMEOUT_MS } from "../shared/constants.js";
 import { endpointBaseUrl } from "../shared/models.js";
 import { sendMagicPacket } from "../network/wol.js";
 import { CoreWebSocket, CoreWebSocketError } from "./events.js";
-import { isTransportError, sleep } from "../shared/util.js";
+import { isTransportError, sleep, versionAtLeast } from "../shared/util.js";
 import { logger } from "../shared/logger.js";
 
 const log = logger("core-client");
@@ -87,6 +88,75 @@ export class CoreClient {
     this.fetchImpl = fetchImpl;
     this.lastWakeAttempts = [];
     this.integrationCollectionPath = null;
+    this.sharedSocket = null;
+    this.sharedIdleTimer = null;
+    this.sharedInflight = 0;
+    this.cachedVersion = null;
+  }
+
+  // -------------------------------------------------------------------------
+  // Shared Core WebSocket session
+  // -------------------------------------------------------------------------
+
+  // The Core limits concurrent WebSocket sessions. Every Core WebSocket request made by this client shares one
+  // lazily opened session, which is closed again after a short idle period.
+  async sharedWebSocket() {
+    clearTimeout(this.sharedIdleTimer);
+    this.sharedIdleTimer = null;
+    if (!this.sharedSocket || (!this.sharedSocket.connected && !this.sharedSocket.connecting)) {
+      this.sharedSocket = new CoreWebSocket(this.endpoint);
+    }
+    await this.sharedSocket.connect();
+    return this.sharedSocket;
+  }
+
+  #releaseShared() {
+    if (this.sharedInflight > 0) return;
+    clearTimeout(this.sharedIdleTimer);
+    this.sharedIdleTimer = setTimeout(() => {
+      this.sharedIdleTimer = null;
+      if (this.sharedInflight > 0) return;
+      const socket = this.sharedSocket;
+      this.sharedSocket = null;
+      socket?.close().catch(() => {});
+    }, 20_000);
+    this.sharedIdleTimer.unref?.();
+  }
+
+  async withSharedWebSocket(callback) {
+    this.sharedInflight += 1;
+    try {
+      return await callback(await this.sharedWebSocket());
+    } finally {
+      this.sharedInflight -= 1;
+      this.#releaseShared();
+    }
+  }
+
+  async close() {
+    clearTimeout(this.sharedIdleTimer);
+    this.sharedIdleTimer = null;
+    const socket = this.sharedSocket;
+    this.sharedSocket = null;
+    await socket?.close();
+  }
+
+  // -------------------------------------------------------------------------
+  // Feature detection
+  // -------------------------------------------------------------------------
+
+  async versionInfo({ refresh = false } = {}) {
+    if (!this.cachedVersion || refresh) this.cachedVersion = await this.version();
+    return this.cachedVersion;
+  }
+
+  async apiVersion() {
+    try { return String((await this.versionInfo())?.api || "") || null; }
+    catch { return null; }
+  }
+
+  async supportsApi(minimum) {
+    return versionAtLeast(await this.apiVersion(), minimum);
   }
 
   get authHeaders() { return { Authorization: `Bearer ${this.endpoint.api_key}` }; }
@@ -117,7 +187,9 @@ export class CoreClient {
       const expected = new Set(options.expected || [200]);
       if (!expected.has(response.status)) {
         const errorBody = await readBody(response);
-        log.warn(`${method} ${url.pathname}${url.search} -> HTTP ${response.status} (${Date.now() - started}ms):`, errorBody);
+        // Statuses the caller expects (feature probes, optional endpoints) are not warnings.
+        const level = (options.optionalStatuses || []).includes(response.status) ? "debug" : "warn";
+        log[level](`${method} ${url.pathname}${url.search} -> HTTP ${response.status} (${Date.now() - started}ms):`, errorBody);
         throw new CoreApiError(response.status, method, `${apiPath}${url.search}`, errorBody, url.toString());
       }
       log.debug(`${method} ${url.pathname}${url.search} -> HTTP ${response.status} (${Date.now() - started}ms)`);
@@ -215,6 +287,7 @@ export class CoreClient {
 
   async requestFirst(attempts, { compatibilityStatuses = [400, 404, 405] } = {}) {
     let lastError = null;
+    let validationError = null;
     for (const attempt of attempts) {
       try {
         if (attempt.kind === "json") return await this.json(attempt.method, attempt.path, attempt.options || {});
@@ -222,10 +295,12 @@ export class CoreClient {
       } catch (error) {
         lastError = error;
         if (!(error instanceof CoreApiError) || !compatibilityStatuses.includes(error.status)) throw error;
+        // A 400 from an existing route is a real validation error; keep it so it is not hidden behind a later 404.
+        if (error.status === 400 && !validationError) validationError = error;
         log.debug(`Compatibility attempt unavailable: ${attempt.method} ${attempt.path} -> ${error.status}`);
       }
     }
-    throw lastError || new Error("No Core API compatibility route succeeded");
+    throw validationError || lastError || new Error("No Core API compatibility route succeeded");
   }
 
   version() { return this.getJson("/pub/version", { authenticated: false, wakeOnUnavailable: false }); }
@@ -265,23 +340,23 @@ export class CoreClient {
   // Integration entity management
   // -------------------------------------------------------------------------
 
-  async reloadAvailableEntities(integrationId, { pageSize = 100, client = null, requiredEntityIds = [] } = {}) {
-    const ws = client || new CoreWebSocket(this.endpoint);
-    const ownsClient = client === null;
+  async reloadAvailableEntities(integrationId, { pageSize = 100, client = null, requiredEntityIds = [], forceReload = true } = {}) {
+    if (!client) return this.withSharedWebSocket((ws) => this.reloadAvailableEntities(integrationId, { pageSize, client: ws, requiredEntityIds, forceReload }));
+    const ws = client;
     const integration = String(integrationId);
     const required = new Set((requiredEntityIds || [])
       .map((value) => integrationLocalEntityId(integration, value))
       .filter(Boolean));
-    const modern = (page, forceReload) => ({
-      force_reload: forceReload,
+    const modern = (page, reload) => ({
+      force_reload: reload,
       filter: { integration_id: integration },
       paging: { page, limit: pageSize }
     });
     const attempts = [
-      modern(1, true),
-      { force_reload: true, filter: { integration_id: integration } },
-      { force_reload: true, integration_id: integration, paging: { page: 1, limit: pageSize } },
-      { force_reload: true, integration_id: integration }
+      modern(1, forceReload),
+      { force_reload: forceReload, filter: { integration_id: integration } },
+      { force_reload: forceReload, integration_id: integration, paging: { page: 1, limit: pageSize } },
+      { force_reload: forceReload, integration_id: integration }
     ];
     const collected = new Map();
     let lastError = null;
@@ -317,7 +392,7 @@ export class CoreClient {
 
           if (!required.size || containsRequired()) {
             const result = [...collected.values()];
-            log.info(`Core refreshed ${result.length} available entity/entities for ${integration}`);
+            log.info(`Core ${forceReload ? "refreshed" : "returned"} ${result.length} available entity/entities for ${integration}`);
             return result;
           }
           log.debug(`Available-entity response shape ${attemptIndex + 1} is missing ${[...required].filter((id) => !collected.has(id)).length} required entity/entities; trying compatibility shape`);
@@ -330,12 +405,12 @@ export class CoreClient {
 
       if (collected.size) {
         const result = [...collected.values()];
-        log.info(`Core refreshed ${result.length} available entity/entities for ${integration}`);
+        log.info(`Core ${forceReload ? "refreshed" : "returned"} ${result.length} available entity/entities for ${integration}`);
         return result;
       }
       throw lastError || new Error(`Core did not return available entities for ${integration}`);
     } finally {
-      if (ownsClient) await ws.close();
+      // The shared session is released by withSharedWebSocket().
     }
   }
 
@@ -343,8 +418,7 @@ export class CoreClient {
     const expected = [...new Set((entityIds || []).map((value) => integrationLocalEntityId(integrationId, value)).filter(Boolean))];
     if (!expected.length) return { available: [], configured: [] };
 
-    const ws = new CoreWebSocket(this.endpoint);
-    try {
+    return this.withSharedWebSocket(async (ws) => {
       const available = await this.reloadAvailableEntities(integrationId, { pageSize, client: ws, requiredEntityIds: expected });
       const availableIds = new Set(available.map((item) => integrationLocalEntityId(integrationId, item?.entity_id ?? item?.id)).filter(Boolean));
       const unavailable = expected.filter((id) => !availableIds.has(id));
@@ -363,19 +437,28 @@ export class CoreClient {
         }
       }
       return { available, configured: expected };
-    } finally {
-      await ws.close();
-    }
+    });
   }
 
   async coreMessage(name, data = undefined, timeoutMs = 30_000) {
-    const ws = new CoreWebSocket(this.endpoint);
-    try {
-      const response = await ws.request(String(name), data, timeoutMs);
-      return response?.msg_data ?? null;
-    } finally {
-      await ws.close();
+    const messageName = String(name);
+    // Read-only requests are retried once on a fresh session if the shared session dropped underneath them.
+    const attempts = messageName.startsWith("get_") ? 2 : 1;
+    let lastError = null;
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      try {
+        const response = await this.withSharedWebSocket((ws) => ws.request(messageName, data, timeoutMs));
+        return response?.msg_data ?? null;
+      } catch (error) {
+        lastError = error;
+        if (error instanceof CoreWebSocketError || attempt + 1 >= attempts) throw error;
+        log.debug(`Core WebSocket ${messageName} failed on the shared session; retrying: ${error.message}`);
+        const socket = this.sharedSocket;
+        this.sharedSocket = null;
+        await socket?.close().catch(() => {});
+      }
     }
+    throw lastError;
   }
 
   async executeEntityCommand(entityId, cmdId, params = undefined) {
@@ -410,6 +493,89 @@ export class CoreClient {
     return this.json("DELETE", `/resources/${encodeURIComponent(resourceType)}/${encodeURIComponent(resourceId)}`, { expected: [200, 204], optionalStatuses: [404] });
   }
 
+  // -------------------------------------------------------------------------
+  // Network configuration
+  // -------------------------------------------------------------------------
+
+  async wakeOnWlan() {
+    const config = await this.getJson("/cfg/network", { optionalStatuses: [404, 405] });
+    if (!config || typeof config !== "object") return null;
+    const value = config.wifi?.wake_on_wlan?.enabled ?? config.wake_on_wlan?.enabled;
+    return typeof value === "boolean" ? value : null;
+  }
+
+  async setWakeOnWlan(enabled = true) {
+    const value = { enabled: Boolean(enabled) };
+    // `wifi.wake_on_wlan` replaces the deprecated top-level `wake_on_wlan` field.
+    return this.requestFirst([
+      { kind: "json", method: "PATCH", path: "/cfg/network", options: { json: { wifi: { wake_on_wlan: value } }, expected: [200, 204] } },
+      { kind: "json", method: "PATCH", path: "/cfg/network", options: { json: { wake_on_wlan: value }, expected: [200, 204] } }
+    ], { compatibilityStatuses: [400, 422] });
+  }
+
+  // -------------------------------------------------------------------------
+  // Activity readiness
+  // -------------------------------------------------------------------------
+
+  async activityReadiness(activityId, command = "on") {
+    try {
+      return await this.getJson(`/activities/${encodeURIComponent(String(activityId))}/readiness`, {
+        params: { command },
+        optionalStatuses: [404, 405, 501],
+        wakeOnUnavailable: false
+      });
+    } catch (error) {
+      log.debug(`Activity readiness check unavailable for ${activityId}: ${error.message}`);
+      return null;
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Integration drivers, installation and remote setup
+  // -------------------------------------------------------------------------
+
+  integrationDriver(driverId) {
+    return this.getJson(`/intg/drivers/${encodeURIComponent(String(driverId))}`, { optionalStatuses: [404] });
+  }
+
+  integrationInstances() {
+    return this.listPaginated("/intg/instances", { optional: true });
+  }
+
+  installCustomIntegration(archive, { update = false, filename = "remote-sync.tar.gz" } = {}) {
+    const form = new FormData();
+    form.append("file", new Blob([archive], { type: "application/gzip" }), filename);
+    return this.json("POST", "/intg/install", {
+      body: form,
+      params: update ? { update: true } : {},
+      timeoutMs: 240_000,
+      expected: [200, 201]
+    });
+  }
+
+  startIntegrationSetup({ driverId, setupData = {}, reconfigure = false, language = undefined }) {
+    const json = { driver_id: String(driverId), setup_data: setupData, reconfigure: Boolean(reconfigure) };
+    if (language) json.language = language;
+    return this.json("POST", "/intg/setup", { json, expected: [200, 201] });
+  }
+
+  integrationSetup(driverId) {
+    return this.getJson(`/intg/setup/${encodeURIComponent(String(driverId))}`, { optionalStatuses: [404] });
+  }
+
+  integrationSetupUserData(driverId, payload) {
+    return this.json("PUT", `/intg/setup/${encodeURIComponent(String(driverId))}`, { json: payload, expected: [200, 201] });
+  }
+
+  keepIntegrationSetupAlive(driverId) {
+    // Older firmware has no keep-alive endpoint and uses fixed setup timeouts instead.
+    return this.json("PUT", `/intg/setup/${encodeURIComponent(String(driverId))}/keepalive`, { expected: [200], optionalStatuses: [404, 405] });
+  }
+
+  abortIntegrationSetup(driverId) {
+    return this.json("DELETE", `/intg/setup/${encodeURIComponent(String(driverId))}`, { expected: [200, 204], optionalStatuses: [404] });
+  }
+
   async withStandbyInhibitor(inhibitorId, who, why, callback) {
     const websocket = new CoreWebSocket(this.endpoint);
     let created = false;
@@ -427,22 +593,77 @@ export class CoreClient {
     }
   }
 
-  static async provisionApiKey(host, pin, { name, scheme = "http", port = null, fetchImpl = fetch } = {}) {
+  static async verifyWebConfiguratorPin(host, pin, { scheme = "http", port = null, fetchImpl = fetch } = {}) {
     const netloc = port ? `${host}:${port}` : host;
-    const credentials = Buffer.from(`web-configurator:${pin}`).toString("base64");
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 10_000);
     try {
-      const response = await fetchImpl(`${scheme}://${netloc}/api/auth/api_keys`, {
+      const response = await fetchImpl(`${scheme}://${netloc}/api/pub/login`, {
         method: "POST",
-        headers: { Authorization: `Basic ${credentials}`, Accept: "application/json", "Content-Type": "application/json" },
-        body: JSON.stringify({ name, scopes: ["admin"] }),
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: JSON.stringify({ username: "web-configurator", password: String(pin || "") }),
         signal: controller.signal
       });
-      const data = await readBody(response);
-      if (response.status !== 201) throw new CoreApiError(response.status, "POST", "/auth/api_keys", data);
-      if (!data?.api_key) throw new Error("Core API key creation response did not contain api_key");
-      return { apiKey: String(data.api_key), active: Boolean(data.active) };
+      if (response.status === 401 || response.status === 403) return false;
+      if (response.status !== 200) throw new CoreApiError(response.status, "POST", "/pub/login", await readBody(response));
+      const cookie = response.headers.get("set-cookie");
+      if (cookie) {
+        fetchImpl(`${scheme}://${netloc}/api/pub/logout`, { method: "POST", headers: { Cookie: cookie.split(";")[0] } }).catch(() => {});
+      }
+      return true;
     } finally { clearTimeout(timer); }
   }
+
+  // API key names must be unique on a Core (422 ALREADY_EXISTS otherwise, e.g. when the same Satellite is added
+  // again). A random suffix keeps every name unique; a clash is retried with a fresh suffix.
+  static async provisionApiKey(host, pin, { name, scheme = "http", port = null, validTo = null, description = null, fetchImpl = fetch } = {}) {
+    const netloc = port ? `${host}:${port}` : host;
+    const credentials = Buffer.from(`web-configurator:${pin}`).toString("base64");
+    const base = String(name || "Remote Sync").trim().slice(0, 42) || "Remote Sync";
+    let lastError = null;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const keyName = `${base} ${crypto.randomBytes(3).toString("hex")}`;
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 10_000);
+      try {
+        const response = await fetchImpl(`${scheme}://${netloc}/api/auth/api_keys`, {
+          method: "POST",
+          headers: { Authorization: `Basic ${credentials}`, Accept: "application/json", "Content-Type": "application/json" },
+          body: JSON.stringify(Object.fromEntries(Object.entries({
+            name: keyName,
+            scopes: ["admin"],
+            active: true,
+            valid_to: validTo ? new Date(validTo).toISOString() : undefined,
+            description: description || undefined
+          }).filter(([, value]) => value !== undefined))),
+          signal: controller.signal
+        });
+        const data = await readBody(response);
+        if (response.status === 422 && /ALREADY_EXISTS/i.test(JSON.stringify(data || ""))) {
+          lastError = new CoreApiError(response.status, "POST", "/auth/api_keys", data);
+          log.warn(`API key name "${keyName}" already exists on ${host}; retrying with another name`);
+          continue;
+        }
+        if (response.status !== 201) throw new CoreApiError(response.status, "POST", "/auth/api_keys", data);
+        if (!data?.api_key) throw new Error("Core API key creation response did not contain api_key");
+        return { apiKey: String(data.api_key), active: Boolean(data.active), name: keyName };
+      } finally { clearTimeout(timer); }
+    }
+    throw lastError;
+  }
+
+  // Revoke keys this integration created earlier (matched by exact name), using a key that is still valid.
+  async deleteApiKeysNamed(names) {
+    const wanted = new Set((Array.isArray(names) ? names : [names]).map((value) => String(value || "")).filter(Boolean));
+    if (!wanted.size) return 0;
+    const keys = await this.listPaginated("/auth/api_keys", { optional: true });
+    let deleted = 0;
+    for (const key of keys) {
+      if (!wanted.has(String(key?.name || "")) || !key?.key_id) continue;
+      await this.json("DELETE", `/auth/api_keys/${encodeURIComponent(String(key.key_id))}`, { expected: [200, 204], optionalStatuses: [404], wakeOnUnavailable: false });
+      deleted += 1;
+    }
+    return deleted;
+  }
+
 }

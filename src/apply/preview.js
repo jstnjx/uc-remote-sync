@@ -28,6 +28,18 @@ function sourceId(record, section) {
   return String(record?.source_id || record?.entity_id || record?.id || "");
 }
 
+const MAX_PREVIEW_ITEMS = 25;
+
+function displayName(record, fallback) {
+  const raw = record?.name ?? record?.detail?.name ?? record?.entity?.name ?? record?.label ?? null;
+  if (typeof raw === "string" && raw.trim()) return raw.trim();
+  if (raw && typeof raw === "object") {
+    const value = raw.en ?? raw.en_US ?? raw.en_UK ?? Object.values(raw).find((item) => typeof item === "string" && item.trim());
+    if (value) return String(value).trim();
+  }
+  return fallback;
+}
+
 export function buildApplyPreview(manifest, config, mappings, proxyCatalog = null) {
   const counts = { create: 0, update: 0, remove: 0, unchanged: 0 };
   const sections = {};
@@ -46,18 +58,22 @@ export function buildApplyPreview(manifest, config, mappings, proxyCatalog = nul
     const kind = SECTION_KINDS[section];
     if (!kind) continue;
     const currentIds = new Set(records.map((record) => sourceId(record, section)).filter(Boolean));
+    const names = new Map(records.map((record) => [sourceId(record, section), displayName(record, sourceId(record, section))]));
+    const items = { create: [], update: [], remove: [] };
     let create = 0;
     let update = 0;
     for (const id of currentIds) {
-      if (mappings.get(sourceNode, kind, id)) update += 1;
-      else create += 1;
+      if (mappings.get(sourceNode, kind, id)) { update += 1; if (items.update.length < MAX_PREVIEW_ITEMS) items.update.push(names.get(id) || id); }
+      else { create += 1; if (items.create.length < MAX_PREVIEW_ITEMS) items.create.push(names.get(id) || id); }
     }
     let remove = 0;
     if (config.sync?.prune) {
       const existing = mappings.items(sourceNode, kind);
-      remove = Object.keys(existing).filter((id) => !currentIds.has(id)).length;
+      const removed = Object.keys(existing).filter((id) => !currentIds.has(id));
+      remove = removed.length;
+      items.remove = removed.slice(0, MAX_PREVIEW_ITEMS);
     }
-    sections[section] = { create, update, remove };
+    sections[section] = { create, update, remove, items };
     counts.create += create;
     counts.update += update;
     counts.remove += remove;

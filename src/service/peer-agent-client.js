@@ -75,12 +75,33 @@ export class PeerAgentClient {
     return this.json(`/v${AGENT_API_VERSION}/pairing/validate`, { method: "POST", json: payload });
   }
 
+  // IP + PIN pairing: the Primary proves control of the Satellite with an admin API key it created on the
+  // Satellite's Core using the Web Configurator PIN. The Satellite verifies the key against its own Core and returns
+  // its pairing token, so the token never has to be copied by hand.
+  async pinPair(coreApiKey, payload = {}) {
+    const result = await this.request(`/v${AGENT_API_VERSION}/pairing/pin`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+      headers: { "Content-Type": "application/json", "X-Remote-Sync-Core-Key": String(coreApiKey || "") }
+    });
+    return result.value;
+  }
+
+  async publicCapabilities() {
+    const result = await this.request(`/v${AGENT_API_VERSION}/capabilities`, { headers: {} });
+    return result.value;
+  }
+
   claim(payload) {
     return this.json(`/v${AGENT_API_VERSION}/pairing/claim`, { method: "POST", json: payload });
   }
 
   rotate(payload) {
     return this.json(`/v${AGENT_API_VERSION}/pairing/rotate`, { method: "POST", json: payload });
+  }
+
+  purge(payload) {
+    return this.json(`/v${AGENT_API_VERSION}/pairing/purge`, { method: "POST", json: payload, timeoutMs: 300_000 });
   }
 
   unpair(payload) {

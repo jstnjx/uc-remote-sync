@@ -50,7 +50,8 @@ export class SyncCoordinator {
 
   async syncSinglePeer(peer, force = true) {
     const snapshot = await this.buildSnapshot({ force });
-    if (!force && snapshot.manifest.content_hash === this.getStatus().last_snapshot_hash) {
+    const status = this.getStatus();
+    if (!force && (snapshot.manifest.content_hash === status.last_snapshot_hash || (snapshot.manifest.change_hash && snapshot.manifest.change_hash === status.last_change_hash))) {
       return { success: true, changed: false };
     }
     const result = await this.pushSnapshot(peer, snapshot.payload);

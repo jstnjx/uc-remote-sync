@@ -3,7 +3,12 @@ import { PeerAgentClient } from "./peer-agent-client.js";
 import fs from "node:fs";
 import path from "node:path";
 import { dataHome } from "../shared/paths.js";
-import { atomicWriteJson, readJson, secureToken, utcNow } from "../shared/util.js";
+import { atomicWriteJson, compareVersions, readJson, secureToken, utcNow } from "../shared/util.js";
+import { APP_VERSION } from "../shared/constants.js";
+import { revokeManagementKey, updateSatellite } from "./satellite-provisioner.js";
+import { logger } from "../shared/logger.js";
+
+const log = logger("satellite-manager");
 
 // -----------------------------------------------------------------------------
 // Satellite runtime management
@@ -25,13 +30,18 @@ function runtimeDefaults() {
 }
 
 export class SatelliteManager {
-  constructor({ getConfig, store, resolvePeer, syncPeer, previewPeer = null, notify }) {
+  constructor({ getConfig, store, resolvePeer, syncPeer, previewPeer = null, notify, updater = updateSatellite, syncedResources = () => [], clientFactory = (url, token) => new PeerAgentClient(url, token), keyRevoker = revokeManagementKey }) {
     this.getConfig = getConfig;
     this.store = store;
     this.resolvePeer = resolvePeer;
     this.syncPeer = syncPeer;
     this.previewPeer = previewPeer;
     this.notify = notify;
+    this.updater = updater;
+    this.syncedResources = syncedResources;
+    this.clientFactory = clientFactory;
+    this.keyRevoker = keyRevoker;
+    this.updating = new Set();
     this.runtimeFile = path.join(dataHome(), "peer-runtime.json");
     this.runtime = new Map(Object.entries(readJson(this.runtimeFile, {})));
     this.persistTimer = null;
@@ -58,6 +68,8 @@ export class SatelliteManager {
       broadcasts: peer.broadcasts || [],
       child_node_id: peer.child_node_id,
       claimed_at: peer.claimed_at,
+      managed: Boolean(peer.core_api_key),
+      updating: this.updating.has(peer.peer_id),
       ...runtimeDefaults(),
       ...(this.runtime.get(peer.peer_id) || {})
     }));
@@ -95,7 +107,52 @@ export class SatelliteManager {
       }
     }));
     if (config && configChanged) this.store.save(config);
+    if (config?.sync?.auto_update_satellites !== false) await this.autoUpdate(peers);
     return this.list();
+  }
+
+  // Satellites paired by address and PIN keep a management key, which lets the Primary install its own version on
+  // them. This replaces the manual "update Satellites before the Primary" rolling-upgrade procedure.
+  async autoUpdate(peers = null) {
+    const config = this.getConfig();
+    const candidates = (peers || config?.peers || []).filter((peer) => {
+      if (!peer.enabled || !peer.core_api_key || this.updating.has(peer.peer_id)) return false;
+      const runtime = this.runtime.get(peer.peer_id) || {};
+      if (runtime.update_attempted_version === APP_VERSION) return false;
+      const version = runtime.version || peer.protocol?.version;
+      return version && version !== "legacy" && compareVersions(version, APP_VERSION) < 0;
+    });
+    const results = [];
+    for (const peer of candidates) {
+      log.info(`Satellite ${peer.name} runs Remote Sync ${(this.runtime.get(peer.peer_id) || {}).version}; updating to ${APP_VERSION}`);
+      results.push(await this.update(peer).catch((error) => ({ success: false, error: error.message })));
+    }
+    return results;
+  }
+
+  async update(peer) {
+    if (this.updating.has(peer.peer_id)) return { success: false, error: "An update is already running" };
+    this.updating.add(peer.peer_id);
+    this.record(peer.peer_id, { last_update_result: `Updating to ${APP_VERSION}` });
+    this.notify?.();
+    try {
+      const runtime = this.runtime.get(peer.peer_id) || {};
+      const result = await this.updater(peer, { resolvedUrl: runtime.url || peer.url });
+      this.record(peer.peer_id, {
+        last_update_at: utcNow(),
+        last_update_result: result.action === "current" ? `Already on ${result.version}` : `${result.action === "installed" ? "Installed" : "Updated to"} ${result.version}`,
+        update_attempted_version: APP_VERSION,
+        version: result.version || runtime.version
+      });
+      return { success: true, ...result };
+    } catch (error) {
+      log.warn(`Updating ${peer.name} failed:`, error.message);
+      this.record(peer.peer_id, { last_update_at: utcNow(), last_update_result: `Update failed: ${error.message}`, update_attempted_version: APP_VERSION });
+      return { success: false, error: error.message };
+    } finally {
+      this.updating.delete(peer.peer_id);
+      this.notify?.();
+    }
   }
 
   async action(peerId, action) {
@@ -119,6 +176,11 @@ export class SatelliteManager {
     if (action === "preview") {
       if (!this.previewPeer) throw new Error("Synchronization preview is unavailable");
       return this.previewPeer(peer);
+    }
+    if (action === "update") {
+      const result = await this.update(peer);
+      if (result.success) await this.refresh(peerId).catch(() => {});
+      return result;
     }
     if (action === "enable" || action === "disable") {
       peer.enabled = action === "enable";
@@ -151,14 +213,33 @@ export class SatelliteManager {
       return { success: true };
     }
     if (action === "unpair" || action === "remove") {
+      let purge = null;
       try {
         const destination = await this.resolvePeer(peer, true);
-        const client = new PeerAgentClient(destination.url, peer.token);
+        const client = this.clientFactory(destination.url, peer.token);
+        if (action === "remove") {
+          // Removing a Satellite deletes everything this Primary synchronized to it before unpairing.
+          const protocol = await client.capabilities().catch(() => null);
+          if (protocol && !protocol.capabilities.includes("purge_on_remove")) {
+            purge = { success: false, skipped: true, error: `The Satellite runs Remote Sync ${protocol.version}, which cannot remove synchronized configuration; update it first or remove the objects manually` };
+          } else {
+            try {
+              purge = await client.purge({ master_id: config.node_id, resources: this.syncedResources() });
+            } catch (error) {
+              purge = { success: false, error: `Synchronized configuration was not removed: ${error.message}` };
+            }
+          }
+          log.info(`Removing ${peer.name}: ${purge?.success ? `deleted ${purge.removed} synchronized object(s)` : purge?.error || "purge failed"}`);
+        }
         await client.unpair({ master_id: config.node_id });
       } catch (error) {
         if (action === "unpair") throw error;
+        purge ||= { success: false, error: `The Satellite was not reachable, so its synchronized configuration was not removed: ${error.message}` };
       }
       if (action === "remove") {
+        // The management key this Primary created on the Satellite is no longer needed.
+        try { await this.keyRevoker(peer, { resolvedUrl: (this.runtime.get(peer.peer_id) || {}).url || peer.url }); }
+        catch (error) { log.warn(`Could not revoke the management key on ${peer.name}:`, error.message); }
         config.peers.splice(index, 1);
         this.runtime.delete(peer.peer_id);
       } else {
@@ -168,7 +249,9 @@ export class SatelliteManager {
       }
       this.store.save(config);
       this.notify?.();
-      return { success: true, removed: action === "remove" };
+      return action === "remove"
+        ? { success: true, removed: true, purge, warning: purge && !purge.success ? purge.error : (purge?.remaining ? `${purge.remaining} object(s) could not be removed` : null) }
+        : { success: true, removed: false };
     }
     throw new Error(`Unsupported satellite action ${action}`);
   }

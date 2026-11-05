@@ -97,7 +97,7 @@ test("proxy entities are force-refreshed and configured through Core WebSocket A
     assert.equal(requests[0].msg_data.filter.integration_id, "remote_sync.main");
     assert.equal(requests[1].msg, "configure_entities_from_integration");
     assert.deepEqual(requests[1].msg_data, { integration_id: "remote_sync.main", entity_ids: ["proxy_aaa", "proxy_bbb"] });
-  } finally { await server.close(); }
+  } finally { await client.close(); await server.close(); }
 });
 
 test("entity configuration falls back from batch to individual WebSocket requests", async () => {
@@ -126,7 +126,7 @@ test("entity configuration falls back from batch to individual WebSocket request
       "get_available_entities", "configure_entities_from_integration",
       "configure_entity_from_integration", "configure_entity_from_integration"
     ]);
-  } finally { await server.close(); }
+  } finally { await client.close(); await server.close(); }
 });
 
 test("available entity refresh merges compatibility response shapes until required proxies are present", async () => {
@@ -157,5 +157,5 @@ test("available entity refresh merges compatibility response shapes until requir
     assert.deepEqual(result.available.map((item) => item.entity_id).sort(), ["proxy_aaa", "proxy_bbb"]);
     assert.equal(requests.filter((item) => item.msg === "get_available_entities").length, 2);
     assert.equal(requests.at(-1).msg, "configure_entities_from_integration");
-  } finally { await server.close(); }
+  } finally { await client.close(); await server.close(); }
 });

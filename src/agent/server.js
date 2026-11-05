@@ -3,7 +3,7 @@ import { AGENT_API_VERSION, MAX_SNAPSHOT_BYTES, MIN_PROTOCOL_VERSION, PROTOCOL_V
 import { RemoteSyncMdnsPublisher } from "../pairing/mdns.js";
 import { protocolDescriptor } from "../protocol/index.js";
 import { SnapshotReader } from "../protocol/snapshot.js";
-import { verifyHmac } from "../shared/util.js";
+import { safeEqual, verifyHmac } from "../shared/util.js";
 import { acceptWebSocketUpgrade, rejectWebSocketUpgrade } from "../transport/websocket.js";
 import { logger } from "../shared/logger.js";
 
@@ -55,11 +55,14 @@ export class AgentServer {
     pairingCallback,
     credentialCallback = null,
     unpairCallback = null,
+    purgeCallback = null,
     satelliteListCallback = null,
     satelliteActionCallback = null,
     commandCallback,
     activityStateCallback = null,
-    dockTunnelCallback = null
+    dockTunnelCallback = null,
+    pinPairingCallback = null,
+    uiHandler = null
   }) {
     this.config = config;
     this.applyCallback = applyCallback;
@@ -69,11 +72,15 @@ export class AgentServer {
     this.pairingCallback = pairingCallback;
     this.credentialCallback = credentialCallback;
     this.unpairCallback = unpairCallback;
+    this.purgeCallback = purgeCallback;
     this.satelliteListCallback = satelliteListCallback;
     this.satelliteActionCallback = satelliteActionCallback;
     this.commandCallback = commandCallback;
     this.activityStateCallback = activityStateCallback;
     this.dockTunnelCallback = dockTunnelCallback;
+    this.pinPairingCallback = pinPairingCallback;
+    this.uiHandler = uiHandler;
+    this.pinFailures = new Map();
     this.server = null;
     this.publisher = null;
   }
@@ -132,13 +139,28 @@ export class AgentServer {
   // -------------------------------------------------------------------------
 
   #authorized(request) {
-    return request.headers.authorization === `Bearer ${this.config.agent_token}`;
+    const header = String(request.headers.authorization || "");
+    return header.startsWith("Bearer ") && safeEqual(header.slice(7), this.config.agent_token);
+  }
+
+  #pinRateLimited(address) {
+    const now = Date.now();
+    const entry = this.pinFailures.get(address);
+    if (!entry || entry.resetAt < now) return false;
+    return entry.count >= 5;
+  }
+
+  #recordPinFailure(address) {
+    const now = Date.now();
+    const entry = this.pinFailures.get(address);
+    if (!entry || entry.resetAt < now) this.pinFailures.set(address, { count: 1, resetAt: now + 5 * 60_000 });
+    else entry.count += 1;
   }
 
   #commandPeer(request) {
     const token = String(request.headers.authorization || "").replace(/^Bearer\s+/i, "");
     if (!token || this.config.role !== "master") return null;
-    return this.config.peers.find((peer) => peer.enabled !== false && peer.command_token && peer.command_token === token) || null;
+    return this.config.peers.find((peer) => peer.enabled !== false && peer.command_token && safeEqual(token, peer.command_token)) || null;
   }
 
   #commandAuthorized(request) {
@@ -276,6 +298,36 @@ export class AgentServer {
         return;
       }
 
+      if (this.uiHandler && (url.pathname === "/" || url.pathname === "/ui" || url.pathname.startsWith("/ui/"))) {
+        await this.uiHandler(request, response, url);
+        return;
+      }
+
+      if (request.method === "POST" && url.pathname === `/v${AGENT_API_VERSION}/pairing/pin`) {
+        if (!["child", "unassigned"].includes(this.config.role) || !this.pinPairingCallback) {
+          jsonResponse(response, 409, { error: "PIN pairing is only available on a satellite or an unassigned installation" });
+          return;
+        }
+        const address = String(request.socket.remoteAddress || "unknown");
+        if (this.#pinRateLimited(address)) {
+          jsonResponse(response, 429, { error: "Too many failed pairing attempts; try again in a few minutes" }, { "Retry-After": "300" });
+          return;
+        }
+        const coreKey = String(request.headers["x-remote-sync-core-key"] || "").trim();
+        await readJson(request);
+        // An unassigned installation becomes a Satellite when a Primary pairs with it.
+        const result = coreKey.length >= 8 ? await this.pinPairingCallback(coreKey) : null;
+        if (!result) {
+          this.#recordPinFailure(address);
+          jsonResponse(response, 401, { error: "The Satellite Core rejected the supplied API key" });
+          return;
+        }
+        this.pinFailures.delete(address);
+        const extra = result && typeof result === "object" ? result : {};
+        jsonResponse(response, 200, this.#pairingPayload({ valid: true, ...extra, agent_token: extra.agent_token || this.config.agent_token }));
+        return;
+      }
+
       if (!this.#authorized(request)) {
         jsonResponse(response, 401, { error: "Unauthorized" }, { "WWW-Authenticate": "Bearer" });
         return;
@@ -334,6 +386,20 @@ export class AgentServer {
         }
         const result = await this.credentialCallback(body);
         jsonResponse(response, 200, this.#pairingPayload({ rotated: true, agent_token: result.agent_token }));
+        return;
+      }
+
+      if (request.method === "POST" && url.pathname === `/v${AGENT_API_VERSION}/pairing/purge`) {
+        if (this.config.role !== "child" || !this.purgeCallback) {
+          jsonResponse(response, 501, { error: "Removing synchronized configuration is unavailable" });
+          return;
+        }
+        const body = await readJson(request, 4 * 1024 * 1024);
+        if (String(body.master_id || "") !== String(this.config.pairing?.paired_master_id || "")) {
+          jsonResponse(response, 409, { error: "Removal requested by a different primary" });
+          return;
+        }
+        jsonResponse(response, 200, await this.purgeCallback({ master_id: body.master_id, resources: Array.isArray(body.resources) ? body.resources : [] }));
         return;
       }
 

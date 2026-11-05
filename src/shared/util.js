@@ -34,6 +34,27 @@ export function verifyHmac(token, payload, signature) {
   return actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
 }
 
+export function safeEqual(actual, expected) {
+  const left = Buffer.from(String(actual ?? ""));
+  const right = Buffer.from(String(expected ?? ""));
+  if (!right.length || left.length !== right.length) return false;
+  return crypto.timingSafeEqual(left, right);
+}
+
+export function compareVersions(left, right) {
+  const parse = (value) => String(value || "").trim().replace(/^v/i, "").split(/[.+-]/).slice(0, 3).map((part) => Number.parseInt(part, 10) || 0);
+  const a = parse(left);
+  const b = parse(right);
+  for (let index = 0; index < 3; index += 1) {
+    if ((a[index] || 0) !== (b[index] || 0)) return (a[index] || 0) < (b[index] || 0) ? -1 : 1;
+  }
+  return 0;
+}
+
+export function versionAtLeast(value, minimum) {
+  return Boolean(value) && compareVersions(value, minimum) >= 0;
+}
+
 export function secureToken(bytes = 32) {
   return crypto.randomBytes(bytes).toString("base64url");
 }

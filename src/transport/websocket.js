@@ -269,7 +269,17 @@ export async function connectWebSocket(urlValue, { headers = {}, timeoutMs = 900
         const index = line.indexOf(":");
         if (index > 0) responseHeaders[line.slice(0, index).trim().toLowerCase()] = line.slice(index + 1).trim();
       }
-      if (status !== 101) return fail(new Error(`WebSocket upgrade failed with status ${status}`));
+      if (status !== 101) {
+        const error = new Error(`WebSocket upgrade failed with status ${status}`);
+        error.status = status;
+        const retryAfter = responseHeaders["retry-after"];
+        if (retryAfter !== undefined) {
+          const seconds = Number(retryAfter);
+          const date = Number.isFinite(seconds) ? null : Date.parse(retryAfter);
+          error.retryAfterMs = Number.isFinite(seconds) ? Math.max(0, seconds * 1000) : (Number.isFinite(date) ? Math.max(0, date - Date.now()) : null);
+        }
+        return fail(error);
+      }
       if (responseHeaders["sec-websocket-accept"] !== acceptKey(key)) return fail(new Error("Invalid WebSocket accept key"));
       settled = true; clearTimeout(timer); socket.off("error", fail);
       const peer = new WebSocketPeer(socket, { maskOutgoing: true, initialData: rest });
