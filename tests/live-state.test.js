@@ -352,3 +352,28 @@ test("Core-internal remote options are not advertised and do not change proxy id
   assert.equal(next.entities[0].options.editable, undefined);
   assert.equal(next.entities[0].local_id, previous.entities[0].local_id);
 });
+
+test("playback position updates are relayed at most every few seconds, other changes immediately", async () => {
+  const published = [];
+  const relay = new ProxyStateRelay({
+    getConfig: () => ({ role: "master", peers: [] }), getClient: () => null, resolvePeerUrl: async () => ({ url: "http://x" }),
+    publish: (states) => published.push(...states), flushDelayMs: 2, positionIntervalMs: 80
+  });
+  relay.setSnapshot({ data: { entities: [{ entity_id: "hass.main.media_player.tv" }] } });
+  const id = "hass.main.media_player.tv";
+  relay.handle({ entity_id: id, attributes: { state: "PLAYING", media_position: 1 } });
+  await new Promise((resolve) => setTimeout(resolve, 15));
+  for (let second = 2; second <= 5; second += 1) relay.handle({ entity_id: id, attributes: { media_position: second } });
+  await new Promise((resolve) => setTimeout(resolve, 15));
+  assert.equal(published.length, 1, "position-only updates are held back");
+
+  relay.handle({ entity_id: id, attributes: { media_title: "Next" } });
+  await new Promise((resolve) => setTimeout(resolve, 15));
+  assert.equal(published.length, 2);
+  assert.deepEqual(published[1].attributes, { media_position: 5, media_title: "Next" }, "a real change carries the latest position");
+
+  relay.handle({ entity_id: id, attributes: { media_position: 9 } });
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  assert.deepEqual(published.at(-1).attributes, { media_position: 9 }, "held positions are still delivered after the interval");
+  relay.clear();
+});

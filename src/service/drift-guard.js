@@ -4,6 +4,8 @@ import { dataHome } from "../shared/paths.js";
 import { atomicWriteJson } from "../shared/util.js";
 import { logger } from "../shared/logger.js";
 import { extractSettings, settingsDifferences } from "../settings/catalog.js";
+import { stableConfiguration } from "../protocol/snapshot.js";
+import { canonicalJson, sha256Bytes } from "../shared/util.js";
 
 const log = logger("drift-guard");
 
@@ -11,6 +13,8 @@ const REPORT_DELAY_MS = 5000;
 const APPLY_GRACE_MS = 30_000;
 const MAX_BACKUPS = 100;
 const SETTINGS_RESTORE_INTERVAL_MS = 60_000;
+
+const CHILD_LISTS = Object.freeze({ profile: ["pages", "groups"] });
 
 const DETAIL_PATHS = Object.freeze({
   activity: (id) => `/activities/${encodeURIComponent(id)}`,
@@ -45,6 +49,10 @@ export class DriftGuard {
     this.lastSettingsRestore = 0;
     this.pendingSettings = null;
     this.settingsRestored = 0;
+    // Fingerprints of synchronized objects as Remote Sync left them (live state removed). Events only make the guard
+    // look again; an object counts as edited only when its configuration really differs from its fingerprint.
+    this.fingerprints = new Map();
+    this.verified = 0;
     this.getClient = getClient;
     this.getMappings = getMappings;
     this.getSourceNode = getSourceNode;
@@ -71,7 +79,7 @@ export class DriftGuard {
   endApply() { this.applying = Math.max(0, this.applying - 1); this.quietUntil = Date.now() + this.applyGraceMs; }
   get suppressed() { return this.applying > 0 || Date.now() < this.quietUntil; }
 
-  status() { return { last_drift: this.lastDrift, reverted_objects: this.reverted, restored_settings: this.settingsRestored, pending: this.pending.size + this.unsent.length }; }
+  status() { return { last_drift: this.lastDrift, reverted_objects: this.reverted, restored_settings: this.settingsRestored, checks: this.verified, pending: this.pending.size + this.unsent.length }; }
 
   #mapped(kinds) {
     const sourceNode = this.getSourceNode();
@@ -161,9 +169,65 @@ export class DriftGuard {
     this.lastDrift = { detected_at: detectedAt, objects: differences.map(({ category, field }) => ({ kind: "setting", id: `${category}.${field}` })) };
   }
 
+  // Fingerprint of one object's configuration, or null when it no longer exists.
+  async #fingerprint(kind, id) {
+    const client = this.getClient();
+    if (!client || !DETAIL_PATHS[kind]) return undefined;
+    const detail = await client.getJson(DETAIL_PATHS[kind](id), { optionalStatuses: [404] });
+    if (!detail) return null;
+    const parts = { detail: stableConfiguration(detail) };
+    for (const child of CHILD_LISTS[kind] || []) {
+      try { parts[child] = stableConfiguration(await client.listPaginated(`${DETAIL_PATHS[kind](id)}/${child}`, { optional: true })); }
+      catch { parts[child] = null; }
+    }
+    return sha256Bytes(canonicalJson(parts));
+  }
+
+  // After every successful synchronization: remember how each synchronized object looks.
+  async captureFingerprints() {
+    const next = new Map();
+    for (const [id, kind] of this.#mapped(["activity", "macro", "activity_group", "profile"])) {
+      try {
+        const fingerprint = await this.#fingerprint(kind, id);
+        if (fingerprint) next.set(`${kind}|${id}`, fingerprint);
+      } catch (error) { log.debug(`Could not fingerprint ${kind} ${id}: ${error.message}`); }
+    }
+    this.fingerprints = next;
+    return Object.fromEntries(next);
+  }
+
+  restoreFingerprints(value) {
+    this.fingerprints = new Map(Object.entries(value && typeof value === "object" ? value : {}));
+  }
+
+  // Candidates from events → objects whose configuration really changed.
+  async #verify(candidates) {
+    const confirmed = [];
+    const seen = new Set();
+    for (const candidate of candidates) {
+      const ids = candidate.id ? [candidate.id] : [...this.#mapped([candidate.kind])].filter(([, kind]) => kind === candidate.kind).map(([id]) => id);
+      for (const id of ids) {
+        const key = `${candidate.kind}|${id}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const expected = this.fingerprints.get(key);
+        let actual;
+        try { actual = await this.#fingerprint(candidate.kind, id); }
+        catch (error) { log.debug(`Could not check ${key}: ${error.message}`); continue; }
+        this.verified += 1;
+        if (actual === undefined) continue;
+        if (!expected) { if (actual) this.fingerprints.set(key, actual); continue; }
+        if (actual === expected) continue;
+        confirmed.push({ ...candidate, id, deleted: actual === null });
+      }
+    }
+    return confirmed;
+  }
+
   async flush() {
-    const objects = [...this.pending.values()];
+    const candidates = [...this.pending.values()];
     this.pending.clear();
+    const objects = this.suppressed ? [] : await this.#verify(candidates);
     if (objects.length) {
       for (const object of objects) await this.#backup(object);
       this.lastDrift = { detected_at: objects[0].detected_at, objects: objects.map(({ kind, id }) => ({ kind, id })) };

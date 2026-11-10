@@ -138,7 +138,8 @@ export function entityChangeAttributes(data) {
 }
 
 export class CoreEventWatcher {
-  constructor(endpoint, callback, { debounceMs = DEFAULT_EVENT_DEBOUNCE_MS, activityStateCallback = null, entityStateCallback = null, reconnectCallback = null, configurationDetailCallback = null, configurationFilter = null } = {}) {
+  constructor(endpoint, callback, { debounceMs = DEFAULT_EVENT_DEBOUNCE_MS, activityStateCallback = null, entityStateCallback = null, reconnectCallback = null, configurationDetailCallback = null, configurationFilter = null, channels = null } = {}) {
+    this.channels = Array.isArray(channels) && channels.length ? channels : null;
     this.configurationDetailCallback = configurationDetailCallback;
     this.configurationFilter = configurationFilter;
     this.endpoint = endpoint;
@@ -160,7 +161,13 @@ export class CoreEventWatcher {
       try {
         this.client = new CoreWebSocket(this.endpoint, { onEvent: (message) => this.handleEvent(message) });
         await this.client.connect();
-        await this.client.subscribeAll();
+        if (this.channels) {
+          // Fall back to everything if this firmware does not know one of the channels.
+          try { await this.client.request("subscribe_events", { channels: this.channels }); }
+          catch (error) { log.debug(`Selective event subscription failed (${error.message}); subscribing to all events`); await this.client.subscribeAll(); }
+        } else {
+          await this.client.subscribeAll();
+        }
         const reconnected = attempt > 0;
         attempt = 0;
         if (reconnected) await this.reconnectCallback?.();
@@ -237,10 +244,10 @@ export class CoreEventWatcher {
     const internal = ["activity", "macro", "remote"].includes(entityType) || entityId.startsWith("uc.main.");
     const stateOnlyActivityUpdate = internal
       && attributeKeys.length > 0
-      && attributeKeys.every((key) => ["state", "progress", "step", "timeout", "total_steps", "error"].includes(String(key)))
-      && !hasConfigurationFields(data);
+      && attributeKeys.every((key) => ["state", "progress", "step", "timeout", "total_steps", "error"].includes(String(key)));
     if (stateOnlyActivityUpdate) return false;
-    // Renamed entities, new icons or changed options: configuration of any entity type.
+    // Renamed entities, new icons or changed options: configuration of any entity type. (A state update of an
+    // activity may repeat its name and options; it was already filtered out above.)
     if (hasConfigurationFields(data)) return true;
     return internal;
   }

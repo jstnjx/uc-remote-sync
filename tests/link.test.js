@@ -319,8 +319,15 @@ function driftFixture({ report = async () => true } = {}) {
       activity_group: { "src-group": "sat-group" }
     })
   };
+  // The Satellite's objects as its Core reports them; tests change them to simulate edits or running activities.
+  const objects = {
+    "/activities/uc.main.sat-act": { entity_id: "uc.main.sat-act", name: { en: "Apple TV" }, attributes: { state: "OFF" }, options: { entity_ids: ["a"] } },
+    "/macros/uc.main.sat-mac": { entity_id: "uc.main.sat-mac", name: { en: "Macro" }, options: {} },
+    "/activity_groups/sat-group": { group_id: "sat-group", name: { en: "Wohnzimmer" }, activities: [{ entity_id: "uc.main.sat-act", state: "OFF" }] },
+    "/profiles/sat-prof": { profile_id: "sat-prof", name: "Family" }
+  };
   const guard = new DriftGuard({
-    getClient: () => ({ getJson: async (p) => ({ path: p, name: { en: "edited locally" } }) }),
+    getClient: () => ({ getJson: async (p) => (objects[p] ? structuredClone(objects[p]) : null), listPaginated: async () => [] }),
     getMappings: () => mappings,
     getSourceNode: () => "primary",
     report: async (objects) => { reports.push(objects); return report(objects); },
@@ -328,18 +335,20 @@ function driftFixture({ report = async () => true } = {}) {
     reportDelayMs: 5,
     applyGraceMs: 50
   });
-  return { guard, reports, backupDir };
+  return { guard, reports, backupDir, objects };
 }
 
 test("a local edit of a synchronized activity is backed up and reported for restoration", async () => {
-  const { guard, reports, backupDir } = driftFixture();
-  assert.equal(guard.note("entity_change", { entity_id: "uc.main.sat-act", entity_type: "activity", event_type: "UPDATE" }), true);
+  const { guard, reports, backupDir, objects } = driftFixture();
+  await guard.captureFingerprints();
+  objects["/activities/uc.main.sat-act"].name = { en: "edited locally" };
+  assert.equal(guard.note("entity_change", { entity_id: "uc.main.sat-act", entity_type: "activity", event_type: "CHANGE" }), true);
   await waitUntil(() => reports.length === 1, 1000, "report");
   assert.deepEqual(reports[0].map(({ kind, id }) => ({ kind, id })), [{ kind: "activity", id: "uc.main.sat-act" }]);
   const files = fs.readdirSync(backupDir);
   assert.equal(files.length, 1);
   const backup = JSON.parse(fs.readFileSync(path.join(backupDir, files[0]), "utf8"));
-  assert.equal(backup.detail.path, "/activities/uc.main.sat-act");
+  assert.equal(backup.detail.name.en, "edited locally");
   assert.equal(guard.status().reverted_objects, 1);
 });
 
@@ -366,7 +375,9 @@ test("Remote Sync's own changes while applying a snapshot are not drift", async 
 
 test("drift found while the link is down is reported once it is back", async () => {
   let online = false;
-  const { guard, reports } = driftFixture({ report: async () => online });
+  const { guard, reports, objects } = driftFixture({ report: async () => online });
+  await guard.captureFingerprints();
+  delete objects["/macros/uc.main.sat-mac"];
   guard.note("entity_change", { entity_id: "uc.main.sat-mac", event_type: "DELETE" });
   await waitUntil(() => reports.length === 1, 1000);
   assert.equal(guard.status().pending, 1);
@@ -539,4 +550,50 @@ test("end to end: a paired Satellite links, mirrors live states and controls the
     master.linkHub.close();
     await agent.stop();
   }
+});
+
+test("starting an activity is not a local edit, although the activity and its group report changes", async () => {
+  const { guard, reports, objects } = driftFixture();
+  await guard.captureFingerprints();
+  // What happens on a Satellite when an activity runs: its state and the group's view of it change.
+  objects["/activities/uc.main.sat-act"].attributes = { state: "ON", step: 2, total_steps: 4 };
+  objects["/activity_groups/sat-group"].activities[0].state = "ON";
+  guard.note("entity_change", { event_type: "CHANGE", entity_id: "uc.main.sat-act", entity_type: "activity", new_state: { name: { en: "Apple TV" }, attributes: { state: "ON" } } });
+  guard.note("activity_group_change", { event_type: "CHANGE", group_id: "sat-group", new_state: objects["/activity_groups/sat-group"] });
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  assert.deepEqual(reports, [], "running an activity must never trigger a restoration");
+  assert.ok(guard.status().checks >= 2, "the objects were checked");
+  guard.stop();
+});
+
+test("a real change of a group's members is still detected", async () => {
+  const { guard, reports, objects } = driftFixture();
+  await guard.captureFingerprints();
+  objects["/activity_groups/sat-group"].activities = [];
+  guard.note("activity_group_change", { event_type: "CHANGE", group_id: "sat-group", new_state: objects["/activity_groups/sat-group"] });
+  await waitUntil(() => reports.length === 1, 1000, "group drift");
+  assert.equal(reports[0][0].kind, "activity_group");
+  guard.stop();
+});
+
+test("the Primary ignores group events that only report running activities", async () => {
+  const { groupFingerprint } = await import("../src/service/index.js");
+  const idle = { group_id: "g", name: { en: "Wohnzimmer" }, options: {}, activities: [{ entity_id: "a", name: { en: "Apple TV" }, state: "OFF" }] };
+  const running = structuredClone(idle); running.activities[0].state = "ON";
+  const edited = structuredClone(idle); edited.activities.push({ entity_id: "b", name: { en: "Vinyl" } });
+  assert.equal(groupFingerprint(idle), groupFingerprint(running));
+  assert.notEqual(groupFingerprint(idle), groupFingerprint(edited));
+  assert.equal(groupFingerprint(idle), groupFingerprint({ ...idle, activities: undefined, activity_ids: ["a"] }), "snapshot records and events compare equal");
+});
+
+test("a Satellite whose last attempt failed is not re-synchronized on every wake-up", async () => {
+  const { service, hub } = masterWithSnapshot("config-B");
+  try {
+    service.satelliteManager.record("sat", { last_attempted_change_hash: "config-B", last_error: "page rejected", last_sync_at: new Date().toISOString() });
+    await hub.onHello({ peer_id: "sat", name: "Sat" }, { applied_change_hash: "config-A" });
+    assert.equal(service.peerSyncTimers.size, 0, "left to the retry backoff");
+    service.satelliteManager.record("sat", { last_attempted_change_hash: "config-OLD" });
+    await hub.onHello({ peer_id: "sat", name: "Sat" }, { applied_change_hash: "config-A" });
+    assert.equal(service.peerSyncTimers.has("sat"), true, "a newer configuration is still sent");
+  } finally { hub.close(); for (const timer of service.peerSyncTimers.values()) clearTimeout(timer); }
 });

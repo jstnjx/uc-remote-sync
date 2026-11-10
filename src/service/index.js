@@ -8,7 +8,8 @@ import { createApplyReport, createStatus, finishReport, redactConfig } from "../
 import { OperationCache } from "../storage/operations.js";
 import { buildProxyCatalog, ProxyCatalogStore } from "../proxy/catalog.js";
 import { defaultPairingUrl, generatePairingIdentifier, normalizePairingIdentifier, RemoteSyncDiscovery } from "../pairing/mdns.js";
-import { isTransportError, reachableAgentUrl, secureToken, sleep, utcNow } from "../shared/util.js";
+import { canonicalJson, isTransportError, reachableAgentUrl, secureToken, sha256Bytes, sleep, utcNow } from "../shared/util.js";
+import { stableConfiguration } from "../protocol/snapshot.js";
 import { PeerAgentClient } from "./peer-agent-client.js";
 import { sendMagicPacket } from "../network/wol.js";
 import { FULL_AUDIT_INTERVAL_MS, MAX_AUTO_SYNC_RSS_BYTES, MAX_EVENT_LOOP_DELAY_MS, MIN_EVENT_SYNC_INTERVAL_MS, PEER_RETRY_BACKOFF_MS, PERIODIC_JITTER_RATIO, WAKE_RETRY_SCHEDULE_MS, WAKE_TIMEOUT_MS } from "../shared/constants.js";
@@ -37,11 +38,23 @@ import { APP_VERSION, DEFAULT_SECTIONS, SUPPORTED_SECTIONS } from "../shared/con
 
 const log = logger("service");
 const DRIFT_RESYNC_INTERVAL_MS = 5 * 60_000;
+// Live states are written to flash at most this often (the catalog can be around a megabyte).
+const PROXY_STATE_SAVE_INTERVAL_MS = 5 * 60_000;
+const MIN_PEER_SYNC_INTERVAL_MS = 5 * 60_000;
+const FAILED_PEER_SYNC_QUIET_MS = 30 * 60_000;
+const SATELLITE_EVENT_CHANNELS = ["configuration", "activity_groups", "profiles", "entity_activity", "entity_macro"];
 
 // Command ids reach the Primary in two spellings: qualified ("light.on", "activity.on") from Remote Sync itself and
 // short ("on") from the Satellite's Integration API. The Core REST API takes the qualified form; the short form is
 // kept as a fallback for Cores that accept it.
 // Converts the age of an action reported by a Satellite into this node's clock.
+// What makes up an activity group's configuration (not the state of its activities).
+export function groupFingerprint(group) {
+  const members = Array.isArray(group?.activity_ids) ? group.activity_ids
+    : (Array.isArray(group?.activities) ? group.activities.map((item) => (typeof item === "string" ? item : item?.entity_id)) : []);
+  return sha256Bytes(canonicalJson(stableConfiguration({ name: group?.name ?? null, icon: group?.icon ?? null, description: group?.description ?? null, options: group?.options ?? null, members: members.filter(Boolean).map(String) })));
+}
+
 export function ageToTime(ageMs) {
   const age = Number(ageMs);
   return Number.isFinite(age) && age >= 0 ? Date.now() - age : null;
@@ -105,6 +118,7 @@ export class RemoteSyncService {
         this.stateRelay.setSnapshot(manifest);
         this.activitySync.setActivities(manifest?.data?.activities);
         if (manifest?.data?.settings) this.settingsFingerprint = settingsFingerprint(manifest.data.settings);
+        for (const group of manifest?.data?.activity_groups || []) if (group?.group_id) this.groupFingerprints.set(String(group.group_id), groupFingerprint(group));
       }
     });
     this.linkHub = null;
@@ -112,6 +126,8 @@ export class RemoteSyncService {
     this.driftGuard = null;
     this.peerSyncTimers = new Map();
     this.driftSyncAt = new Map();
+    this.groupFingerprints = new Map();
+    this.peerSyncAt = new Map();
     this.hardwareProfile = null;
     this.stateRelay = new ProxyStateRelay({
       getConfig: () => this.config,
@@ -221,7 +237,11 @@ export class RemoteSyncService {
     } catch (error) { this.status.state = `unreachable: ${error.message}`; }
     if (config.role === "master") {
       this.watcher = new CoreEventWatcher(config.remote, (events) => this.#configurationEvents(events), {
-        configurationFilter: (name, data) => name !== "configuration_change" || this.#settingsChanged(data?.new_state),
+        configurationFilter: (name, data) => {
+          if (name === "configuration_change") return this.#settingsChanged(data?.new_state);
+          if (name === "activity_group_change") return this.#groupChanged(data);
+          return true;
+        },
         activityStateCallback: (event) => this.activitySync.broadcast(event),
         entityStateCallback: (event) => this.stateRelay.handle(event),
         reconnectCallback: async () => { this.status.pending_changes = true; this.configurationRevision += 1; this.syncCoordinator.invalidateCache(); this.#scheduleEventSync(); }
@@ -349,6 +369,18 @@ export class RemoteSyncService {
     return memory.rss < MAX_AUTO_SYNC_RSS_BYTES && eventLoopMs < MAX_EVENT_LOOP_DELAY_MS;
   }
 
+  // activity_group_change also reports the running state of the group's activities. Only a change of the group itself
+  // (name, icon, options, members) is a configuration change.
+  #groupChanged(data) {
+    const eventType = String(data?.event_type || "").toUpperCase();
+    const groupId = String(data?.group_id || data?.new_state?.group_id || "");
+    if (!groupId || !data?.new_state || ["NEW", "CREATE", "DELETE"].includes(eventType)) return true;
+    const fingerprint = groupFingerprint(data.new_state);
+    const previous = this.groupFingerprints.get(groupId);
+    this.groupFingerprints.set(groupId, fingerprint);
+    return previous !== fingerprint;
+  }
+
   // A configuration_change event carries every system setting; only a change of a synchronized one is relevant.
   #settingsChanged(cfgAll) {
     if (!this.config?.sync?.sections?.includes("settings") || !cfgAll) return false;
@@ -418,7 +450,14 @@ export class RemoteSyncService {
         const outdated = appliedChange && currentChange ? appliedChange !== currentChange
           : (!applied && !appliedChange) ? Boolean(currentChange || currentContent)
             : Boolean(currentContent && applied !== currentContent);
-        if (outdated) this.#queuePeerSync(peer.peer_id, applied || appliedChange ? "configuration changed while the Satellite was away" : "Satellite has no configuration yet");
+        if (!outdated) return;
+        // A configuration this Satellite already failed to apply is not pushed again on every wake-up; the retry
+        // backoff takes care of it.
+        const runtime = this.satelliteManager.list().find((item) => item.peer_id === peer.peer_id) || {};
+        const recentlyFailed = currentChange && runtime.last_attempted_change_hash === currentChange && runtime.last_error
+          && Date.now() - Date.parse(runtime.last_sync_at || 0) < FAILED_PEER_SYNC_QUIET_MS;
+        if (recentlyFailed) { log.info(`${peer.name || peer.peer_id} is still missing the current configuration; the last attempt failed, waiting for the scheduled retry`); return; }
+        this.#queuePeerSync(peer.peer_id, applied || appliedChange ? "configuration changed while the Satellite was away" : "Satellite has no configuration yet");
       }
     });
   }
@@ -432,6 +471,18 @@ export class RemoteSyncService {
       const peer = this.config?.peers?.find((item) => item.peer_id === peerId && item.enabled);
       if (!peer || this.config?.role !== "master") return;
       if (this.syncing) { this.#queuePeerSync(peerId, reason, { fresh }); return; }
+      // The same guards as every other automatic synchronization: never while this remote is under load, and not more
+      // often than every few minutes per Satellite (repeated full synchronizations are what makes remotes sluggish).
+      const wait = Math.max(0, (this.peerSyncAt.get(peerId) || 0) + MIN_PEER_SYNC_INTERVAL_MS - Date.now());
+      if (wait > 0 || !this.#automaticLoadAllowed()) {
+        const delay = wait || 60_000;
+        log.info(`Synchronizing ${peer.name || peerId} later (${wait ? "recently synchronized" : "this remote is busy"}); retrying in ${Math.round(delay / 1000)}s`);
+        const later = setTimeout(() => { this.peerSyncTimers.delete(peerId); this.#queuePeerSync(peerId, reason, { fresh }); }, delay);
+        later.unref?.();
+        this.peerSyncTimers.set(peerId, later);
+        return;
+      }
+      this.peerSyncAt.set(peerId, Date.now());
       log.info(`Synchronizing ${peer.name || peerId}: ${reason}`);
       this.syncing = true;
       try {
@@ -448,7 +499,8 @@ export class RemoteSyncService {
           last_sync_result: result.success ? `Synchronized (${reason})` : (result.error || "Synchronization failed"),
           last_error: result.success ? null : (result.error || result.report?.error || "Synchronization failed"),
           last_applied_hash: result.success ? snapshot.manifest.content_hash : undefined,
-          last_attempted_hash: snapshot.manifest.content_hash
+          last_attempted_hash: snapshot.manifest.content_hash,
+          last_attempted_change_hash: snapshot.manifest.change_hash || null
         });
         if (!result.success) this.#schedulePeerRetry(peerId);
       } catch (error) {
@@ -486,6 +538,7 @@ export class RemoteSyncService {
         for (const warning of report.warnings) log.warn(warning);
       }
     });
+    this.driftGuard.restoreFingerprints(this.proxyCatalog?.applied_fingerprints);
     this.link = new LinkClient({
       getTarget: () => ({ url: this.config?.pairing?.master_agent_url, token: this.config?.pairing?.master_command_token }),
       hello: () => ({
@@ -513,6 +566,8 @@ export class RemoteSyncService {
     // Satellites also watch their own Core: edits to configuration that came from the Primary are reverted.
     if (!this.watcher) {
       this.watcher = new CoreEventWatcher(this.config.remote, async () => {}, {
+        // Only what the drift guard needs: not the device-state events Remote Sync itself pushes into this remote.
+        channels: SATELLITE_EVENT_CHANNELS,
         configurationFilter: () => true,
         configurationDetailCallback: (name, data) => this.driftGuard?.note(name, data)
       });
@@ -730,6 +785,13 @@ export class RemoteSyncService {
         if (!manifest.sections.includes("settings")) this.proxyCatalog.applied_settings = {};
         else if (applier.appliedSettings) this.proxyCatalog.applied_settings = applier.appliedSettings;
         this.driftGuard?.setAppliedSettings(this.proxyCatalog.applied_settings || {});
+        // Remember how every synchronized object looks now, so later events can be checked against it.
+        const catalog = this.proxyCatalog;
+        this.driftGuard?.captureFingerprints().then((fingerprints) => {
+          if (this.proxyCatalog !== catalog) return;
+          catalog.applied_fingerprints = fingerprints;
+          this.proxyStore.save(catalog);
+        }).catch((error) => log.debug("Could not record configuration fingerprints:", error.message));
         this.proxyStore.save(this.proxyCatalog);
         // Proxy entities were rebuilt from snapshot attributes; take the current live states again.
         this.link?.requestResync();
@@ -1041,7 +1103,7 @@ export class RemoteSyncService {
   // every few seconds (and on shutdown) so a restarted driver starts from recent values.
   #scheduleProxySave() {
     if (this.proxySaveTimer) return;
-    this.proxySaveTimer = setTimeout(() => this.#flushProxySave(), 5000);
+    this.proxySaveTimer = setTimeout(() => this.#flushProxySave(), PROXY_STATE_SAVE_INTERVAL_MS);
     this.proxySaveTimer.unref?.();
   }
 

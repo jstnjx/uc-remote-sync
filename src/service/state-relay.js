@@ -6,6 +6,10 @@ const log = logger("state-relay");
 const FLUSH_DELAY_MS = 250;
 const PUSH_TIMEOUT_MS = 5000;
 const READ_CONCURRENCY = 4;
+// Playback position changes every second while something plays. The Remote's player view advances the position by
+// itself, so updates that only move the position are relayed at most this often per entity.
+const POSITION_ONLY_INTERVAL_MS = 10_000;
+const POSITION_KEYS = new Set(["media_position", "media_position_updated_at", "position"]);
 
 // Attribute values a proxy entity can carry (the same rule the proxy catalog applies to snapshot attributes).
 export function proxyAttributes(value) {
@@ -40,7 +44,11 @@ export function proxiedSourceIds(manifest) {
 // enabled Satellite, coalesced per entity, so proxy entities show and follow the Primary's real state.
 
 export class ProxyStateRelay {
-  constructor({ getConfig, getClient, resolvePeerUrl, fetchImpl = (...args) => fetch(...args), flushDelayMs = FLUSH_DELAY_MS, publish = null, linkedPeer = () => false }) {
+  constructor({ getConfig, getClient, resolvePeerUrl, fetchImpl = (...args) => fetch(...args), flushDelayMs = FLUSH_DELAY_MS, publish = null, linkedPeer = () => false, positionIntervalMs = POSITION_ONLY_INTERVAL_MS }) {
+    this.positionIntervalMs = positionIntervalMs;
+    this.lastSent = new Map();
+    this.deferred = new Map();
+    this.deferTimer = null;
     this.publish = publish;
     this.linkedPeer = linkedPeer;
     this.getConfig = getConfig;
@@ -60,6 +68,10 @@ export class ProxyStateRelay {
   clear() {
     clearTimeout(this.timer);
     this.timer = null;
+    clearTimeout(this.deferTimer);
+    this.deferTimer = null;
+    this.deferred.clear();
+    this.lastSent.clear();
     this.pending.clear();
     this.known.clear();
     this.unsupportedPeers.clear();
@@ -96,8 +108,28 @@ export class ProxyStateRelay {
     const id = String(event?.entity_id || "");
     if (!id || !this.sources.has(id)) return false;
     const attributes = event.attributes ? proxyAttributes(event.attributes) : null;
-    const previous = this.pending.get(id);
-    if (attributes === null || previous === null) this.pending.set(id, null);
+    if (attributes && Object.keys(attributes).length && Object.keys(attributes).every((key) => POSITION_KEYS.has(key)) && !this.pending.has(id)) {
+      const due = (this.lastSent.get(id) || 0) + this.positionIntervalMs - Date.now();
+      if (due > 0) {
+        this.known.set(id, { ...(this.known.get(id) || {}), ...attributes });
+        this.deferred.set(id, { ...(this.deferred.get(id) || {}), ...attributes });
+        if (!this.deferTimer) {
+          this.deferTimer = setTimeout(() => {
+            this.deferTimer = null;
+            const ready = [...this.deferred];
+            this.deferred.clear();
+            for (const [deferredId, values] of ready) this.handle({ entity_id: deferredId, attributes: values, deferred: true });
+          }, Math.min(due, this.positionIntervalMs));
+          this.deferTimer.unref?.();
+        }
+        return true;
+      }
+    }
+    // A real change carries any position update that was held back with it.
+    const held = this.deferred.get(id);
+    if (held && !event.deferred) this.deferred.delete(id);
+    const previous = held && !event.deferred ? { ...held, ...(this.pending.get(id) || {}) } : this.pending.get(id);
+    if (attributes === null || this.pending.get(id) === null) this.pending.set(id, null);
     else this.pending.set(id, { ...(previous || {}), ...attributes });
     if (attributes) this.known.set(id, { ...(this.known.get(id) || {}), ...attributes });
     if (!this.timer) {
@@ -124,6 +156,7 @@ export class ProxyStateRelay {
     const states = [];
     const unresolved = [];
     for (const [id, attributes] of batch) {
+      this.lastSent.set(id, Date.now());
       if (attributes && Object.keys(attributes).length) states.push({ source_entity_id: id, attributes });
       else unresolved.push(id);
     }
