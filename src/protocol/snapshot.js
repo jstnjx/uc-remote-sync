@@ -4,6 +4,8 @@ import { promisify } from "node:util";
 import { MAX_RESOURCE_BYTES, MAX_RESOURCE_COUNT, MAX_SNAPSHOT_BYTES, MAX_TOTAL_RESOURCE_BYTES, MAX_UNCOMPRESSED_SNAPSHOT_BYTES, PROTOCOL_VERSION, SNAPSHOT_ENTITY_CONCURRENCY, SNAPSHOT_SCHEMA_VERSION } from "../shared/constants.js";
 import { canonicalJson, firstIdentifier, sha256Bytes, utcNow } from "../shared/util.js";
 import { logger } from "../shared/logger.js";
+import { readHardwareProfile } from "../apply/hardware.js";
+import { extractSettings } from "../settings/catalog.js";
 
 const log = logger("snapshot");
 const gzipAsync = promisify(gzip);
@@ -87,11 +89,20 @@ export class SnapshotBuilder {
     if (sections.includes("entities")) { data.entities = await this.#collectEntities(); log.info(`Collected ${data.entities.length} configured entity/entities`); }
     this.#checkpoint();
     if (sections.includes("activities")) { data.activities = await this.#collectInternal("activities", "activity"); log.info(`Collected ${data.activities.length} activity/activities`); }
-    if (sections.includes("activity_groups")) { data.activity_groups = await this.#listOptional("/activity_groups"); log.info(`Collected ${data.activity_groups.length} activity group(s)`); }
+    if (sections.includes("activity_groups")) { data.activity_groups = await this.#collectActivityGroups(); log.info(`Collected ${data.activity_groups.length} activity group(s)`); }
     if (sections.includes("macros")) { data.macros = await this.#collectMacros(); log.info(`Collected ${data.macros.length} macro(s)`); }
     if (sections.includes("remotes")) { data.remotes = await this.#collectInternal("remotes", "remote"); log.info(`Collected ${data.remotes.length} remote entity/entities`); }
     if (sections.includes("profiles")) { data.profiles = await this.#collectProfiles(); log.info(`Collected ${data.profiles.items.length} profile(s)`); }
     if (sections.includes("docks")) { data.docks = await this.#collectDocks(); log.info(`Collected ${data.docks.length} dock(s)`); }
+    if (sections.includes("settings")) {
+      try {
+        data.settings = extractSettings(await this.client.getJson("/cfg"), this.config.sync.settings_categories);
+        log.info(`Collected device settings: ${Object.keys(data.settings).join(", ") || "none"}`);
+      } catch (error) {
+        this.warnings.push(`Device settings could not be read: ${error.message}`);
+        data.settings = {};
+      }
+    }
     this.#checkpoint();
     if (sections.includes("resources")) { await this.#collectResources(resources, payloads); log.info(`Collected ${resources.length} resource file(s)`); }
     const requiredIntegrations = [...this.#requiredIntegrations(data.entities || [])].sort();
@@ -113,7 +124,8 @@ export class SnapshotBuilder {
       change_hash: changeHash,
       data,
       resources,
-      warnings: [...this.warnings]
+      warnings: [...this.warnings],
+      source_hardware: await readHardwareProfile(this.client).catch(() => null)
     };
     this.#checkpoint();
     if (resources.length > MAX_RESOURCE_COUNT) throw new Error(`Snapshot resource count exceeds ${MAX_RESOURCE_COUNT}`);
@@ -393,6 +405,29 @@ export class SnapshotBuilder {
       }
     }
     records.sort((a, b) => `${a.type}/${a.id}`.localeCompare(`${b.type}/${b.id}`));
+  }
+
+  // The group list only has names and an activity count; which activities belong to a group is part of each group's
+  // detail. Membership is stored as `activity_ids`; when a detail cannot be read the membership stays unknown (and is
+  // then left unchanged on the Satellites rather than emptied).
+  async #collectActivityGroups() {
+    const overview = await this.#listOptional("/activity_groups");
+    const result = [];
+    for (const item of overview) {
+      const groupId = firstIdentifier(item, "group_id", "id");
+      if (!groupId) continue;
+      this.#checkpoint();
+      const detail = await this.#getOptional(`/activity_groups/${encodeURIComponent(groupId)}`);
+      const record = { ...item, ...(detail && typeof detail === "object" ? detail : {}), group_id: String(groupId) };
+      if (Array.isArray(detail?.activities)) {
+        record.activity_ids = detail.activities.map((activity) => (typeof activity === "string" ? activity : firstIdentifier(activity, "entity_id", "id"))).filter(Boolean).map(String);
+      } else {
+        delete record.activity_ids;
+        this.warnings.push(`Members of activity group ${groupId} could not be read; its membership is left unchanged on Satellites`);
+      }
+      result.push(record);
+    }
+    return result;
   }
 
   async #listOptional(endpoint) {

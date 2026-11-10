@@ -1,3 +1,4 @@
+import { SETTINGS_CATEGORIES } from "../settings/catalog.js";
 import { DEFAULT_SECTIONS } from "../shared/constants.js";
 import { utcNow } from "../shared/util.js";
 
@@ -88,6 +89,12 @@ export function buildApplyPreview(manifest, config, mappings, proxyCatalog = nul
       sections.entities ||= { create: 0, update: 0, remove: 0 };
       sections.entities.remove += obsolete;
     }
+  }
+
+  if (manifest.sections?.includes("settings")) {
+    const categories = Object.keys(manifest.data?.settings || {});
+    sections.settings = { create: 0, update: categories.length, remove: 0, items: { create: [], update: categories.map((id) => SETTINGS_CATEGORIES[id]?.label || id), remove: [] } };
+    counts.update += categories.length;
   }
 
   return {

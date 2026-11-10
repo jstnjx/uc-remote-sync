@@ -60,6 +60,9 @@ export class AgentServer {
     satelliteActionCallback = null,
     commandCallback,
     activityStateCallback = null,
+    proxyStateCallback = null,
+    proxyStatesCallback = null,
+    linkCallback = null,
     dockTunnelCallback = null,
     pinPairingCallback = null,
     uiHandler = null
@@ -77,6 +80,9 @@ export class AgentServer {
     this.satelliteActionCallback = satelliteActionCallback;
     this.commandCallback = commandCallback;
     this.activityStateCallback = activityStateCallback;
+    this.proxyStateCallback = proxyStateCallback;
+    this.proxyStatesCallback = proxyStatesCallback;
+    this.linkCallback = linkCallback;
     this.dockTunnelCallback = dockTunnelCallback;
     this.pinPairingCallback = pinPairingCallback;
     this.uiHandler = uiHandler;
@@ -175,6 +181,16 @@ export class AgentServer {
     let url;
     try { url = new URL(request.url, "http://localhost"); }
     catch { rejectWebSocketUpgrade(socket, 400, "Bad Request"); return; }
+    if (url.pathname === `/v${AGENT_API_VERSION}/link`) {
+      const satellite = this.#commandPeer(request);
+      if (!satellite) { rejectWebSocketUpgrade(socket, 401, "Unauthorized"); return; }
+      if (!this.linkCallback) { rejectWebSocketUpgrade(socket, 501, "Not Implemented"); return; }
+      const peer = acceptWebSocketUpgrade(request, socket, head);
+      if (!peer) return;
+      try { this.linkCallback({ socket: peer, peer: satellite }); }
+      catch (error) { log.warn("Link setup failed:", error.message); try { peer.close(1011, "Link unavailable"); } catch { peer.terminate(); } }
+      return;
+    }
     if (url.pathname !== `/v${AGENT_API_VERSION}/dock/tunnel`) {
       rejectWebSocketUpgrade(socket, 404, "Not Found");
       return;
@@ -264,8 +280,44 @@ export class AgentServer {
           jsonResponse(response, 400, { error: "source_entity_id and cmd_id are required" });
           return;
         }
-        const result = await this.commandCallback({ source_entity_id: sourceEntityId, cmd_id: cmdId, params: body.params || undefined });
+        const entityType = typeof body.entity_type === "string" && body.entity_type.trim() ? body.entity_type.trim() : null;
+        const age = Number(body.issued_age_ms);
+        const issuedAt = Number.isFinite(age) && age >= 0 ? Date.now() - age : NaN;
+        const result = await this.commandCallback({ source_entity_id: sourceEntityId, cmd_id: cmdId, params: body.params || undefined, ...(entityType ? { entity_type: entityType } : {}), ...(Number.isFinite(issuedAt) && issuedAt > 0 ? { issued_at: issuedAt } : {}) });
         jsonResponse(response, result.success ? 200 : (result.status || 502), result);
+        return;
+      }
+
+      // Primary → Satellite: live attributes of proxied entities.
+      if (request.method === "POST" && url.pathname === `/v${AGENT_API_VERSION}/proxy/state`) {
+        if (!this.#authorized(request)) {
+          jsonResponse(response, 401, { error: "Unauthorized proxy state update" }, { "WWW-Authenticate": "Bearer" });
+          return;
+        }
+        if (this.config.role !== "child" || !this.proxyStateCallback) {
+          jsonResponse(response, 409, { error: "Proxy state updates are only accepted by satellite remotes" });
+          return;
+        }
+        const body = await readJson(request, 4 * 1024 * 1024);
+        if (!Array.isArray(body.states)) {
+          jsonResponse(response, 400, { error: "states must be a list" });
+          return;
+        }
+        jsonResponse(response, 200, await this.proxyStateCallback(body.states));
+        return;
+      }
+
+      // Satellite → Primary: current attributes of every proxied entity, used after a Satellite starts or wakes up.
+      if (request.method === "GET" && url.pathname === `/v${AGENT_API_VERSION}/proxy/states`) {
+        if (!this.#commandAuthorized(request)) {
+          jsonResponse(response, 401, { error: "Unauthorized proxy state request" }, { "WWW-Authenticate": "Bearer" });
+          return;
+        }
+        if (this.config.role !== "master" || !this.proxyStatesCallback) {
+          jsonResponse(response, 409, { error: "Proxy states are only served by a primary" });
+          return;
+        }
+        jsonResponse(response, 200, { states: await this.proxyStatesCallback() });
         return;
       }
 

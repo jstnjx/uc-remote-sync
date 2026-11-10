@@ -93,7 +93,7 @@ export function createUiHandler(service, { now = () => Date.now() } = {}) {
     else entry.count += 1;
   };
 
-  const SYNC_KEYS = ["sections", "interval_seconds", "auto_sync", "prune", "use_standby_inhibitor", "verify_existing_resource_hashes", "auto_update_satellites"];
+  const SYNC_KEYS = ["sections", "interval_seconds", "auto_sync", "prune", "use_standby_inhibitor", "verify_existing_resource_hashes", "auto_update_satellites", "settings_categories"];
   const GENERAL_KEYS = ["node_name", "agent_public_url", "dock_tokens", "clear_dock_tokens", "mac_override", "broadcast_overrides"];
   const pick = (body, keys) => Object.fromEntries(keys.filter((key) => body[key] !== undefined).map((key) => [key, body[key]]));
 
@@ -104,7 +104,7 @@ export function createUiHandler(service, { now = () => Date.now() } = {}) {
 
     // Available for every role
     if (method === "GET" && path === "/status") {
-      const payload = { ...service.statusPayload(), wake_on_wlan: await service.wakeOnWlanState(), provisioning: service.provisioningStatus() };
+      const payload = { ...service.statusPayload(), wake_on_wlan: await service.wakeOnWlanState(), setup_finished: await service.setupFinished?.() ?? null, provisioning: service.provisioningStatus() };
       // Fallback token for Primaries on 0.8.x, shown on an unpaired Satellite's dashboard (signed-in sessions only).
       if (role === "child" && !service.config.pairing?.paired_master_id) payload.pairing_token = service.config.agent_token;
       json(response, 200, payload);

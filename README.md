@@ -30,8 +30,8 @@ npm run package
 Generated installation files:
 
 ```text
-remote-sync-0.9.0.tar.gz
-remote-sync-0.9.0.tar.gz.sha256
+remote-sync-0.11.1.tar.gz
+remote-sync-0.11.1.tar.gz.sha256
 ```
 
 Tests remain in the source repository but are not copied into the Remote installation archive. The archive is produced by `src/shared/package.js`, the same builder a Primary uses at runtime to install Remote Sync on Satellites. The version is read from `driver.json`; `package.json` must match it.
@@ -39,7 +39,7 @@ Tests remain in the source repository but are not copied into the Remote install
 ## Install on Remote Two/3
 
 1. Open **Web Configurator → Integrations → Add new → Install custom**.
-2. Select `remote-sync-0.9.0.tar.gz`.
+2. Select `remote-sync-0.11.1.tar.gz`.
 3. Select **Update existing driver** when upgrading.
 4. Only the Primary has to be installed by hand. Satellites added by address and PIN are installed and kept on the Primary's version automatically. For Satellites paired with a token (0.8.x style), update them before the Primary.
 
@@ -88,7 +88,7 @@ docker compose logs -f remote-sync
 Pin a release:
 
 ```bash
-REMOTE_SYNC_IMAGE=ghcr.io/jstnjx/uc-remote-sync:0.9.0 docker compose up -d
+REMOTE_SYNC_IMAGE=ghcr.io/jstnjx/uc-remote-sync:0.11.1 docker compose up -d
 ```
 
 Build locally:
@@ -157,6 +157,22 @@ POST /v1/satellites/<peer-id>/actions/<action>
 Supported Satellite actions are `sync`, `preview`, `update`, `enable`, `disable`, `rediscover`, `rotate`, `unpair` and `remove`. `unpair` keeps the synchronized configuration on the Satellite; `remove` first calls `POST /v1/pairing/purge` on the Satellite, which deletes every object it recorded while applying this Primary's snapshots (plus the resources of the Primary's current snapshot), then unpairs. Objects that cannot be deleted stay tracked, so a later removal retries them. A Satellite on 0.8.x or one that is offline is still removed from the Primary, and the dashboard reports that its configuration was left in place. The Primary integration exposes a status sensor and an action select per Satellite.
 
 A synchronization preview can also be started through the global **Preview synchronization** button or with `POST /v1/sync` using `dry_run: true`. Preview mode estimates create, update and remove operations without applying the snapshot.
+
+### Staying in sync
+
+Any remote can be the Primary — a Remote Two, a Remote 3 or an external instance (Docker, Node.js) — and any mix of Remote Two and Remote 3 can be Satellites.
+
+**Persistent link.** Every Satellite keeps one WebSocket open to the Primary while it is awake (`/v1/link`, authenticated with its command token; heartbeats every 15 s). The Primary numbers every live update — device states and activity states — within an epoch that changes when the Primary restarts. A Satellite that reconnects reports the last number it applied: missed updates are replayed, and if they are no longer buffered (or the Primary restarted) it receives a complete state image instead. Gaps are detected and repaired, never guessed. Commands, button presses and activity starts travel up the same link; if the link is down they fall back to HTTP, which also wakes a sleeping Primary over WLAN. A command that was sent over the link but not answered is never repeated, so nothing runs twice.
+
+**Configuration: the Primary is the master.** On every (re)connection the Satellite reports which configuration it has applied; if it missed a change it is synchronized at once. Edits made directly on a Satellite to anything that came from the Primary (activities, macros, activity groups, profiles, pages) are detected, a backup of the edited object is kept on the Satellite (`data/drift-backups/`), and the Primary's version is restored. Repeated restorations of the same Satellite are limited to one every five minutes. Objects that exist only on the Satellite are never touched.
+
+**Activities: the newest action wins.** Actions carry their age rather than a timestamp, so the remotes' clocks never have to agree. An activity start or stop that reaches the Primary after a newer change of that activity (for example one queued while the Primary was asleep) is dropped, and every remote is told the current state.
+
+**Hardware differences.** Each remote reports its model, physical buttons and screen grid (`/cfg/device/button_layout`, `/cfg/device/screen_layout`). The Primary ships its own profile with every snapshot and each Satellite adapts what it receives: button mappings for buttons it does not have are skipped, and UI pages larger than its screen are reduced, skipping items that no longer fit. Every adaptation is listed in the Satellite's dashboard. When a layout cannot be read nothing is removed.
+
+**Device settings (optional).** Enable *Device settings* under Settings → Synchronization on the Primary and choose what to keep identical: button backlight (brightness, automatic backlight, static colour), display brightness, haptic feedback, sound effects, power saving and standby timers, and — off by default — language/region/time, microphone and the software-update schedule. The device name, Wi-Fi and network, Bluetooth peripherals, the admin PIN, feature flags and the voice assistant are never synchronized. Satellites write only settings their own hardware reports (a static button colour is skipped on remotes without colour backlight) and only values that differ; anything a Satellite rejects is reported, never failing the synchronization. A synchronized setting changed directly on a Satellite is backed up and restored to the Primary's value (at most once a minute; brightness is left alone while automatic brightness is on). Changing a synchronized setting on the Primary triggers a synchronization on its own.
+
+**Standby.** A remote in standby stops all integration drivers, Remote Sync included, so nothing can be exchanged while it sleeps. The guarantee is therefore: no update is ever silently lost — whatever happened while a remote slept is caught up as soon as it is awake and linked. For a Primary that is always reachable, run it on an always-on machine (Docker or Node.js).
 
 ### IP + PIN pairing
 

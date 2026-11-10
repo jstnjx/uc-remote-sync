@@ -115,11 +115,36 @@ export class CoreWebSocket {
 // Core event watcher
 // -----------------------------------------------------------------------------
 
+// Changed attributes of an entity_change event. Cores report them as `attributes`, inside `new_state` or inside
+// `entity`; null means the event carried none and the entity has to be read back.
+// Event types that add or remove something. The Core sends NEW / DELETE; CREATE is accepted for older firmware.
+const STRUCTURAL_EVENTS = new Set(["NEW", "CREATE", "DELETE"]);
+const CONFIGURATION_FIELDS = ["name", "icon", "description", "options"];
+
+function hasConfigurationFields(data) {
+  const update = data?.new_state && typeof data.new_state === "object" ? data.new_state : null;
+  return Boolean(update) && CONFIGURATION_FIELDS.some((key) => update[key] !== undefined);
+}
+
+export function entityChangeAttributes(data) {
+  if (!data || typeof data !== "object") return null;
+  for (const candidate of [data.attributes, data.new_state?.attributes, data.entity?.attributes]) {
+    if (candidate && typeof candidate === "object" && !Array.isArray(candidate)) return candidate;
+  }
+  if (typeof data.new_state === "string") return { state: data.new_state };
+  if (typeof data.state === "string") return { state: data.state };
+  if (typeof data.new_state?.state === "string") return { state: data.new_state.state };
+  return null;
+}
+
 export class CoreEventWatcher {
-  constructor(endpoint, callback, { debounceMs = DEFAULT_EVENT_DEBOUNCE_MS, activityStateCallback = null, reconnectCallback = null } = {}) {
+  constructor(endpoint, callback, { debounceMs = DEFAULT_EVENT_DEBOUNCE_MS, activityStateCallback = null, entityStateCallback = null, reconnectCallback = null, configurationDetailCallback = null, configurationFilter = null } = {}) {
+    this.configurationDetailCallback = configurationDetailCallback;
+    this.configurationFilter = configurationFilter;
     this.endpoint = endpoint;
     this.callback = callback;
     this.activityStateCallback = activityStateCallback;
+    this.entityStateCallback = entityStateCallback;
     this.debounceMs = debounceMs;
     this.reconnectCallback = reconnectCallback;
     this.stopped = false;
@@ -133,7 +158,7 @@ export class CoreEventWatcher {
     let attempt = 0;
     while (!this.stopped) {
       try {
-        this.client = new CoreWebSocket(this.endpoint, { onEvent: (message) => this.#event(message) });
+        this.client = new CoreWebSocket(this.endpoint, { onEvent: (message) => this.handleEvent(message) });
         await this.client.connect();
         await this.client.subscribeAll();
         const reconnected = attempt > 0;
@@ -150,6 +175,9 @@ export class CoreEventWatcher {
       if (!this.stopped) await sleep(backoff[Math.min(attempt++, backoff.length - 1)]);
     }
   }
+  // Entry point for every Core event message ({ msg, msg_data }).
+  handleEvent(message) { this.#event(message); }
+
   #event(message) {
     const name = String(message.msg || "");
     const data = message.msg_data;
@@ -157,7 +185,14 @@ export class CoreEventWatcher {
     if (activityState && this.activityStateCallback) {
       Promise.resolve(this.activityStateCallback(activityState)).catch((error) => log.error("Activity-state callback failed:", error));
     }
+    const entityState = this.#entityStateEvent(name, data);
+    if (entityState && this.entityStateCallback) {
+      try { this.entityStateCallback(entityState); } catch (error) { log.error("Entity-state callback failed:", error); }
+    }
     if (!this.#configurationEvent(name, data)) return;
+    if (this.configurationDetailCallback) {
+      try { this.configurationDetailCallback(name, data); } catch (error) { log.error("Configuration-detail callback failed:", error); }
+    }
     this.pending.add(name);
     clearTimeout(this.timer);
     this.timer = setTimeout(() => this.#flush(), this.debounceMs);
@@ -168,9 +203,9 @@ export class CoreEventWatcher {
     const entityType = String(data.entity_type || data.entity?.entity_type || "").toLowerCase();
     const entityId = String(data.entity_id || data.entity?.entity_id || "");
     const eventType = String(data.event_type || "").toUpperCase();
-    if (!entityId || ["CREATE", "DELETE"].includes(eventType)) return null;
+    if (!entityId || STRUCTURAL_EVENTS.has(eventType)) return null;
     if (entityType !== "activity" && !entityId.startsWith("uc.main.")) return null;
-    const state = data.attributes?.state ?? data.state ?? data.entity?.attributes?.state ?? data.new_state;
+    const state = entityChangeAttributes(data)?.state;
     return {
       source_activity_id: entityId,
       state: typeof state === "string" ? state : null,
@@ -178,24 +213,36 @@ export class CoreEventWatcher {
       event_type: eventType
     };
   }
+  #entityStateEvent(name, data) {
+    if (name !== "entity_change" || !data || typeof data !== "object") return null;
+    const eventType = String(data.event_type || "").toUpperCase();
+    const entityId = String(data.entity_id || data.entity?.entity_id || "");
+    if (!entityId || STRUCTURAL_EVENTS.has(eventType) || entityId.startsWith("remote_sync.main.")) return null;
+    return { entity_id: entityId, entity_type: String(data.entity_type || data.entity?.entity_type || "").toLowerCase() || null, attributes: entityChangeAttributes(data) };
+  }
   #configurationEvent(name, data) {
     if (!CONFIG_EVENT_NAMES.has(name)) return false;
+    if (this.configurationFilter && !this.configurationFilter(name, data)) return false;
+    if (name === "configuration_change") return Boolean(this.configurationFilter);
     if (name !== "entity_change") return true;
     if (!data || typeof data !== "object") return true;
     const eventType = String(data.event_type || "").toUpperCase();
     const entityType = String(data.entity_type || "").toLowerCase();
     const entityId = String(data.entity_id || "");
     if (entityId.startsWith("remote_sync.main.")) return false;
-    const changedAttributes = data.attributes && typeof data.attributes === "object"
-      ? data.attributes
-      : (data.entity?.attributes && typeof data.entity.attributes === "object" ? data.entity.attributes : {});
+    // Added or removed entities always change the configuration (the Core reports NEW; older docs said CREATE).
+    if (STRUCTURAL_EVENTS.has(eventType)) return true;
+    const changedAttributes = entityChangeAttributes(data) || {};
     const attributeKeys = Object.keys(changedAttributes);
-    const stateOnlyActivityUpdate = (entityType === "activity" || entityId.startsWith("uc.main."))
-      && !["CREATE", "DELETE"].includes(eventType)
-      && (attributeKeys.length > 0 || typeof data.state === "string" || typeof data.new_state === "string")
-      && attributeKeys.every((key) => ["state", "progress", "step", "timeout", "total_steps", "error"].includes(String(key)));
+    const internal = ["activity", "macro", "remote"].includes(entityType) || entityId.startsWith("uc.main.");
+    const stateOnlyActivityUpdate = internal
+      && attributeKeys.length > 0
+      && attributeKeys.every((key) => ["state", "progress", "step", "timeout", "total_steps", "error"].includes(String(key)))
+      && !hasConfigurationFields(data);
     if (stateOnlyActivityUpdate) return false;
-    return ["CREATE", "DELETE"].includes(eventType) || ["activity", "macro", "remote"].includes(entityType) || entityId.startsWith("uc.main.");
+    // Renamed entities, new icons or changed options: configuration of any entity type.
+    if (hasConfigurationFields(data)) return true;
+    return internal;
   }
   async #flush() {
     this.timer = null;

@@ -1,10 +1,31 @@
 import crypto from "node:crypto";
 import * as uc from "./api.js";
 import { ACTIVITY_RELAY_LOCAL_ID } from "../shared/constants.js";
+import { logger } from "../shared/logger.js";
+
+const log = logger("entities");
 
 // -----------------------------------------------------------------------------
 // Proxy entity factory
 // -----------------------------------------------------------------------------
+
+// The Remote waits about 10 seconds for an entity command and then reports a timeout. Forwarding to the Primary can
+// take longer (a sleeping Primary is woken first, and the Primary's Core only answers an activity command once the
+// activity has run), so commands answer the Remote before that deadline and finish in the background.
+export const COMMAND_ANSWER_DEADLINE_MS = 8000;
+export const RELAY_ANSWER_DEADLINE_MS = 2500;
+
+export async function answerWithin(promise, deadlineMs, onLate) {
+  let timer = null;
+  const late = Symbol("late");
+  const result = await Promise.race([
+    promise,
+    new Promise((resolve) => { timer = setTimeout(() => resolve(late), deadlineMs); })
+  ]).finally(() => clearTimeout(timer));
+  if (result !== late) return result;
+  promise.then(onLate, (error) => onLate({ success: false, error: error.message }));
+  return { success: true, pending: true };
+}
 
 function proxyEntity(descriptor, service) {
   return new uc.Entity(
@@ -20,7 +41,14 @@ function proxyEntity(descriptor, service) {
       options: descriptor.options,
       area: descriptor.area,
       cmdHandler: async (_entity, cmdId, params) => {
-        const result = await service.forwardProxyCommand(descriptor.source_entity_id, cmdId, params);
+        // The Integration API delivers short command ids ("on", "play_pause"); the Primary's Core REST API expects
+        // them qualified with the entity type ("media_player.play_pause"). The Primary tries the qualified form first.
+        const forwarded = service.forwardProxyCommand(descriptor.source_entity_id, cmdId, params, { entityType: descriptor.entity_type });
+        const result = await answerWithin(forwarded, COMMAND_ANSWER_DEADLINE_MS, (late) => {
+          if (!late?.success) log.warn(`${cmdId} for ${descriptor.source_entity_id} failed on the Primary after the Remote was answered: ${late?.error || `HTTP ${late?.status}`}`);
+        });
+        if (result.pending) log.info(`${cmdId} for ${descriptor.source_entity_id} is still running on the Primary; answered the Remote early`);
+        else if (!result.success) log.warn(`${cmdId} for ${descriptor.source_entity_id} failed: ${result.error || `HTTP ${result.status}`}`);
         return result.success ? uc.StatusCodes.Ok : (result.status || uc.StatusCodes.ServiceUnavailable);
       }
     }
@@ -55,6 +83,17 @@ export class EntityManager {
     this.satelliteIds = new Set();
     service.addStatusListener((status, config) => this.onStatus(status, config));
     service.addProxyListener((catalog) => this.applyProxyCatalog(catalog));
+    service.addProxyStateListener?.((changes) => this.applyProxyStates(changes));
+  }
+
+  // Live attribute changes of proxy entities; reported to the Remote for subscribed entities.
+  applyProxyStates(changes) {
+    if (!this.registered) return;
+    for (const { local_id: id, attributes } of changes || []) {
+      if (!this.proxyIds.has(id)) continue;
+      this.api.getAvailableEntities().updateEntityAttributes(id, attributes);
+      this.api.updateEntityAttributes(id, attributes);
+    }
   }
 
   register() {
@@ -89,8 +128,19 @@ export class EntityManager {
       cmdHandler: async (_entity, _cmdId, params) => {
         const sourceActivityId = String(params?.source_activity_id || "").trim();
         const action = String(params?.action || "").trim().toLowerCase();
-        if (!sourceActivityId || !["on", "off"].includes(action)) return uc.StatusCodes.BadRequest;
-        const result = await this.service.forwardActivityCommand(sourceActivityId, action);
+        if (!sourceActivityId || !["on", "off"].includes(action)) {
+          log.warn(`Activity relay received ${_cmdId} without usable parameters (${JSON.stringify(params ?? null)}); the activity sequence on this Satellite may be outdated — run a synchronization from the Primary`);
+          return uc.StatusCodes.BadRequest;
+        }
+        // The Satellite's activity only consists of this relay step, so it must not hold the activity open while the
+        // Primary runs its own (often longer) sequence.
+        const forwarded = this.service.forwardActivityCommand(sourceActivityId, action);
+        const report = (result) => {
+          if (result?.success) log.info(`Relayed activity ${sourceActivityId} ${action} to the Primary`);
+          else log.warn(`Relaying activity ${sourceActivityId} ${action} to the Primary failed: ${result?.error || `HTTP ${result?.status}`}`);
+        };
+        const result = await answerWithin(forwarded, RELAY_ANSWER_DEADLINE_MS, report);
+        if (!result.pending) report(result);
         return result.success ? uc.StatusCodes.Ok : (result.status || uc.StatusCodes.ServiceUnavailable);
       }
     }));
@@ -122,10 +172,7 @@ export class EntityManager {
       next.add(entity.id);
       this.api.upsertAvailableEntity(entity);
       const configured = this.api.getConfiguredEntities().getEntity(entity.id);
-      if (configured) {
-        this.api.getConfiguredEntities().upsertEntity(entity);
-        this.api.updateEntityAttributes(entity.id, descriptor.attributes || { state: "UNKNOWN" });
-      }
+      if (configured) this.api.getConfiguredEntities().upsertEntity(proxyEntity(descriptor, this.service));
     }
     for (const id of this.proxyIds) {
       if (next.has(id)) continue;

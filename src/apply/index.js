@@ -5,6 +5,8 @@ import { logger } from "../shared/logger.js";
 import { ACTIVITY_RELAY_ENTITY_ID, ACTIVITY_RELAY_LOCAL_ID } from "../shared/constants.js";
 import { ProfileApplier } from "./profiles.js";
 import { DockApplier } from "./docks.js";
+import { HardwareAdapter } from "./hardware.js";
+import { applyDeviceSettings } from "./settings.js";
 
 // -----------------------------------------------------------------------------
 // Payload schemas
@@ -23,11 +25,14 @@ const READ_ONLY_KEYS = new Set(["entity_type", "integration_id", "features", "at
 // -----------------------------------------------------------------------------
 
 export class SnapshotApplier {
-  constructor(client, config, operationCache, mappings) {
+  constructor(client, config, operationCache, mappings, { hardware = null } = {}) {
     this.client = client;
     this.config = config;
     this.operationCache = operationCache;
     this.mappings = mappings;
+    // Adapts button mappings and UI pages from the Primary's hardware to this remote's (Remote Two ↔ Remote 3).
+    this.hardware = hardware || new HardwareAdapter(null, null);
+    this.appliedSettings = null;
   }
 
   // -------------------------------------------------------------------------
@@ -52,6 +57,10 @@ export class SnapshotApplier {
         }
       } else await apply();
       this.mappings.save();
+      if (this.hardware.adjustments.length) {
+        report.hardware_adjustments = [...this.hardware.adjustments];
+        report.warnings.push(...this.hardware.adjustments.map((item) => `Hardware: ${item}`));
+      }
       finishReport(report, report.errors.length === 0);
     } catch (error) {
       report.errors.push(error.message);
@@ -68,6 +77,9 @@ export class SnapshotApplier {
     if (manifest.sections.includes("activities") && (manifest.data.activities || []).length) await this.#ensureActivityRelay(report);
     if (manifest.sections.includes("resources")) await this.#applyResources(manifest, resources, report);
     if (manifest.sections.includes("docks")) Object.assign(mapping, await this.#dockApplier().apply(manifest.source_node_id, manifest.data.docks || [], report));
+    if (manifest.sections.includes("settings")) {
+      this.appliedSettings = await applyDeviceSettings(this.client, manifest.data.settings || {}, report, { adjustments: this.hardware.adjustments });
+    }
     let macroStage = null;
     let activityStage = null;
     if (manifest.sections.includes("macros")) {
@@ -285,10 +297,10 @@ export class SnapshotApplier {
       let updatePayload = this.#rewriteConfiguredReferences(this.#cleanPayload(editableFields(detail, INTERNAL_UPDATE_FIELDS)), mapping, report, context);
       if (section === "activities") updatePayload = this.#activityRelayPayload(updatePayload, sourceId);
       const buttonPayload = record.buttons !== undefined
-        ? this.#rewriteConfiguredReferences(record.buttons, mapping, report, `${context} buttons`)
+        ? this.hardware.buttons(this.#rewriteConfiguredReferences(record.buttons, mapping, report, `${context} buttons`), `${context} buttons`)
         : undefined;
       const uiPayload = record.ui !== undefined
-        ? this.#rewriteConfiguredReferences(record.ui || {}, mapping, report, `${context} UI`)
+        ? this.hardware.ui(this.#rewriteConfiguredReferences(record.ui || {}, mapping, report, `${context} UI`), `${context} UI`)
         : undefined;
       try {
         await this.#updateInternalEntity(section, targetId, updatePayload, buttonPayload, uiPayload, context, report);
@@ -416,26 +428,48 @@ export class SnapshotApplier {
   // Activity groups
   // -------------------------------------------------------------------------
 
+  // Activity groups. Membership comes from the Primary's group details (`activity_ids`) and is written with the
+  // Satellite's own activity ids. It is applied in two passes: first every activity is taken out of groups it must
+  // leave, then each group gets its exact list — so an activity is never in two groups at once, and an activity that
+  // belongs to the "Schlafzimmer" group on the Primary ends up there and not in whichever group happens to be the
+  // Satellite's default.
   async #applyActivityGroups(sourceNode, records, mapping, report) {
     const local = {};
     const currentIds = new Set();
+    const plans = [];
     for (const raw of records) {
       if (!raw || typeof raw !== "object") continue;
       const sourceId = firstIdentifier(raw, "group_id", "id");
       if (!sourceId) continue;
       currentIds.add(sourceId);
+      const context = `activity group ${sourceId}`;
+      const membership = this.#groupMembership(raw);
+      let targetActivityIds = null;
+      if (membership) {
+        targetActivityIds = [];
+        const missing = [];
+        for (const activityId of membership) {
+          const target = mapping[activityId] || this.mappings.get(sourceNode, "activity", activityId);
+          if (target) targetActivityIds.push(String(target));
+          else missing.push(activityId);
+        }
+        if (missing.length) report.warnings.push(`${context}: ${missing.length} activity/activities are not synchronized and were left out: ${missing.slice(0, 5).join(", ")}`);
+        targetActivityIds = [...new Set(targetActivityIds)];
+      }
+      const metadata = this.#rewriteConfiguredReferences(this.#cleanPayload(editableFields(raw, ACTIVITY_GROUP_FIELDS)), mapping, report, context);
+      delete metadata.activities;
+      delete metadata.activity_ids;
       let targetId = this.mappings.get(sourceNode, "activity_group", sourceId);
-      const payload = this.#rewriteConfiguredReferences(this.#cleanPayload(editableFields(raw, ACTIVITY_GROUP_FIELDS)), mapping, report, `activity group ${sourceId}`);
       try {
         if (targetId && await this.#exists(`/activity_groups/${encodeURIComponent(targetId)}`)) {
-          await this.client.json("PATCH", `/activity_groups/${encodeURIComponent(targetId)}`, { json: payload, expected: [200] });
+          if (Object.keys(metadata).length) await this.client.json("PATCH", `/activity_groups/${encodeURIComponent(targetId)}`, { json: metadata, expected: [200] });
           incrementReport(report, "activity_groups_updated");
         } else if (await this.#exists(`/activity_groups/${encodeURIComponent(sourceId)}`)) {
           targetId = sourceId;
-          await this.client.json("PATCH", `/activity_groups/${encodeURIComponent(targetId)}`, { json: payload, expected: [200] });
+          if (Object.keys(metadata).length) await this.client.json("PATCH", `/activity_groups/${encodeURIComponent(targetId)}`, { json: metadata, expected: [200] });
           incrementReport(report, "activity_groups_updated");
         } else {
-          const created = await this.client.json("POST", "/activity_groups", { json: payload, expected: [200, 201] });
+          const created = await this.client.json("POST", "/activity_groups", { json: { ...metadata, activity_ids: [] }, expected: [200, 201] });
           targetId = firstIdentifier(created, "group_id", "id");
           if (!targetId) throw new Error("Create response did not contain group_id");
           incrementReport(report, "activity_groups_created");
@@ -443,10 +477,76 @@ export class SnapshotApplier {
         this.mappings.set(sourceNode, "activity_group", sourceId, targetId);
         local[sourceId] = targetId;
         mapping[sourceId] = targetId;
+        plans.push({ sourceId, targetId: String(targetId), targetActivityIds, context });
       } catch (error) { report.errors.push(`Activity group ${sourceId}: ${error.message}`); }
     }
+
+    await this.#applyGroupMembership(plans, report);
     if (this.config.sync.prune) await this.#pruneMapped(sourceNode, "activity_group", "activity_groups", currentIds, report);
     return local;
+  }
+
+  #groupMembership(raw) {
+    if (Array.isArray(raw.activity_ids)) return raw.activity_ids.map(String).filter(Boolean);
+    if (Array.isArray(raw.activities)) {
+      const ids = raw.activities.map((item) => (typeof item === "string" ? item : firstIdentifier(item, "entity_id", "id"))).filter(Boolean).map(String);
+      return ids;
+    }
+    return null;
+  }
+
+  async #groupActivityIds(groupId) {
+    const detail = await this.client.getJson(`/activity_groups/${encodeURIComponent(groupId)}`, { optionalStatuses: [404] });
+    if (!detail) return null;
+    if (Array.isArray(detail.activity_ids)) return detail.activity_ids.map(String);
+    return (Array.isArray(detail.activities) ? detail.activities : []).map((item) => (typeof item === "string" ? item : firstIdentifier(item, "entity_id", "id"))).filter(Boolean).map(String);
+  }
+
+  async #setGroupActivities(groupId, activityIds) {
+    await this.client.json("PATCH", `/activity_groups/${encodeURIComponent(groupId)}`, { json: { activity_ids: activityIds }, expected: [200] });
+  }
+
+  async #applyGroupMembership(plans, report) {
+    for (const plan of plans.filter((item) => !item.targetActivityIds)) report.warnings.push(`${plan.context}: membership unknown, left unchanged`);
+    const known = plans.filter((plan) => plan.targetActivityIds);
+    if (!known.length) return;
+    const owner = new Map();
+    for (const plan of known) for (const activityId of plan.targetActivityIds) owner.set(activityId, plan.targetId);
+    const synchronizedGroups = new Set(plans.map((plan) => plan.targetId));
+
+    // Pass 1: take activities out of every group they do not belong to — synchronized groups, and also groups that only
+    // exist on this Satellite, for activities the Primary placed in a synchronized group.
+    const current = new Map();
+    let allGroups = [];
+    try { allGroups = await this.client.listPaginated("/activity_groups", { optional: true }); }
+    catch (error) { report.warnings.push(`Could not list this remote's activity groups: ${error.message}`); }
+    const groupIds = new Set([...synchronizedGroups, ...allGroups.map((item) => firstIdentifier(item, "group_id", "id")).filter(Boolean).map(String)]);
+    for (const groupId of groupIds) {
+      let members;
+      try { members = await this.#groupActivityIds(groupId); }
+      catch (error) { report.warnings.push(`Could not read activity group ${groupId}: ${error.message}`); continue; }
+      if (!members) continue;
+      const plan = known.find((item) => item.targetId === groupId);
+      const keep = plan
+        ? members.filter((id) => plan.targetActivityIds.includes(id))
+        : members.filter((id) => !owner.has(id));
+      current.set(groupId, keep);
+      if (keep.length === members.length) continue;
+      try {
+        await this.#setGroupActivities(groupId, keep);
+        incrementReport(report, "activity_group_members_moved", members.length - keep.length);
+      } catch (error) { report.errors.push(`Activity group ${groupId}: could not remove activities: ${error.message}`); }
+    }
+
+    // Pass 2: give every synchronized group exactly the Primary's activities, in the Primary's order.
+    for (const plan of known) {
+      const now = current.get(plan.targetId) || [];
+      if (now.length === plan.targetActivityIds.length && now.every((id, index) => id === plan.targetActivityIds[index])) continue;
+      try {
+        await this.#setGroupActivities(plan.targetId, plan.targetActivityIds);
+        incrementReport(report, "activity_group_memberships_updated");
+      } catch (error) { report.errors.push(`${plan.context}: could not set activities: ${error.message}`); }
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -455,6 +555,7 @@ export class SnapshotApplier {
 
   #profileApplier() {
     return new ProfileApplier({
+      adaptPage: (page, context) => this.hardware.page(page, context),
       client: this.client,
       config: this.config,
       mappings: this.mappings,

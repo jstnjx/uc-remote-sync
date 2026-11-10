@@ -131,13 +131,23 @@ export class Select extends Entity {
   }
 }
 
+function cloneEntity(entity) {
+  const copy = Object.assign(Object.create(Object.getPrototypeOf(entity)), entity);
+  copy.attributes = structuredClone(entity.attributes || {});
+  return copy;
+}
+
 class EntityStore {
   constructor(onUpdate = null) { this.entities = new Map(); this.onUpdate = onUpdate; }
   addAvailableEntity(entity) { if (this.entities.has(entity.id)) return false; this.entities.set(entity.id, entity); return true; }
   upsertEntity(entity) {
     const existing = this.entities.get(entity.id);
     if (existing) {
-      Object.assign(existing, entity);
+      // Metadata and the command handler are replaced in place; attributes go through updateEntityAttributes() so a
+      // changed state is reported to the Remote instead of being swapped in silently.
+      const { attributes, ...metadata } = entity;
+      Object.assign(existing, metadata);
+      if (attributes && typeof attributes === "object") this.updateEntityAttributes(entity.id, attributes);
       return false;
     }
     this.entities.set(entity.id, entity);
@@ -257,7 +267,10 @@ export class IntegrationAPI extends EventEmitter {
     this.state = DeviceStates.Disconnected;
     this.clients = new Set();
     this.setupHandler = null;
-    this.availableEntities = new EntityStore((entity, attrs) => this.#broadcast("entity_change", { entity_id: entity.id, entity_type: entity.entity_type, attributes: attrs }, "ENTITY"));
+    // Only configured (subscribed) entities report changes to the Remote. Both stores hold their own entity
+    // instances: when they shared one object, an update applied to the available store already mutated the
+    // configured entity, so the configured store saw "no change" and the Remote never received the new state.
+    this.availableEntities = new EntityStore();
     this.configuredEntities = new EntityStore((entity, attrs) => this.#broadcast("entity_change", { entity_id: entity.id, entity_type: entity.entity_type, attributes: attrs }, "ENTITY"));
     this.wsServer = null;
     this.mdns = null;
@@ -314,8 +327,8 @@ export class IntegrationAPI extends EventEmitter {
     return this.remoteVersion;
   }
 
-  async getRuntimeInfo(peer = null) {
-    const response = await this.requestRemote("get_runtime_info", undefined, 5000, peer);
+  async getRuntimeInfo(peer = null, timeoutMs = 5000) {
+    const response = await this.requestRemote("get_runtime_info", undefined, timeoutMs, peer);
     if (response?.code && (response.code < 200 || response.code >= 300)) throw new Error(`get_runtime_info returned ${response.code}`);
     this.runtimeInfo = response?.msg_data && typeof response.msg_data === "object" ? response.msg_data : null;
     return this.runtimeInfo;
@@ -388,7 +401,13 @@ export class IntegrationAPI extends EventEmitter {
       }
       case "get_entity_states": this.#response(peer, id, "entity_states", this.configuredEntities.getStates()); break;
       case "subscribe_events": {
-        for (const entityId of data.entity_ids || []) { const entity = this.availableEntities.getEntity(entityId); if (entity) this.configuredEntities.addAvailableEntity(entity); }
+        const missing = [];
+        for (const entityId of data.entity_ids || []) {
+          const entity = this.availableEntities.getEntity(entityId);
+          if (entity) this.configuredEntities.addAvailableEntity(cloneEntity(entity));
+          else missing.push(entityId);
+        }
+        if (missing.length) log.warn(`Remote subscribed to ${missing.length} unknown entity/entities: ${missing.slice(0, 8).join(", ")}`);
         this.emit(Events.SubscribeEntities, data.entity_ids || []); this.#response(peer, id, "result"); break;
       }
       case "unsubscribe_events": {
@@ -396,8 +415,18 @@ export class IntegrationAPI extends EventEmitter {
         this.emit(Events.UnsubscribeEntities, data.entity_ids || []); this.#response(peer, id, "result"); break;
       }
       case "entity_command": {
-        const entity = this.configuredEntities.getEntity(data.entity_id);
-        if (!entity) this.#response(peer, id, "result", {}, StatusCodes.NotFound);
+        let entity = this.configuredEntities.getEntity(data.entity_id);
+        if (!entity) {
+          // The Remote only sends commands for entities it has configured. If its subscription arrived before the
+          // entity was advertised here, adopt the available entity instead of rejecting the command.
+          const available = this.availableEntities.getEntity(data.entity_id);
+          if (available) {
+            log.info(`Adopting ${data.entity_id} as configured: the Remote sent a command without a prior subscription`);
+            entity = cloneEntity(available);
+            this.configuredEntities.addAvailableEntity(entity);
+          }
+        }
+        if (!entity) { log.warn(`Command ${data.cmd_id} for unknown entity ${data.entity_id}`); this.#response(peer, id, "result", {}, StatusCodes.NotFound); }
         else this.#response(peer, id, "result", {}, await entity.command(data.cmd_id, data.params));
         break;
       }

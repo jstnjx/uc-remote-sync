@@ -58,6 +58,9 @@ export const DEFAULT_SECTIONS = [
   "profiles",
   "docks"
 ];
+// Optional sections that are off until enabled in the dashboard.
+export const OPTIONAL_SECTIONS = ["settings"];
+export const SUPPORTED_SECTIONS = [...DEFAULT_SECTIONS, ...OPTIONAL_SECTIONS];
 export const INTERNAL_ENTITY_PREFIXES = ["uc.main.activity.", "uc.main.macro.", "uc.main.remote.", "remote_sync.main."];
 export const BAD_INTEGRATION_STATES = new Set([
   "DISCONNECTED", "CONNECTING", "RECONNECTING", "ERROR", "UNAVAILABLE", "UNKNOWN",
@@ -65,5 +68,5 @@ export const BAD_INTEGRATION_STATES = new Set([
 ]);
 export const CONFIG_EVENT_NAMES = new Set([
   "integration_change", "integration_driver_change", "entity_change", "activity_group_change",
-  "profile_change", "active_profile_change", "dock_change"
+  "profile_change", "active_profile_change", "dock_change", "configuration_change"
 ]);

@@ -22,8 +22,10 @@ export class ProfileApplier {
     exists,
     pruneMapped,
     responseList,
-    webSocketCompatibilityError
+    webSocketCompatibilityError,
+    adaptPage = (page) => page
   }) {
+    this.adaptPage = adaptPage;
     this.client = client;
     this.config = config;
     this.mappings = mappings;
@@ -107,7 +109,7 @@ export class ProfileApplier {
     for (const page of pages) {
       const sourcePageId = firstIdentifier(page, "page_id", "id");
       const context = `profile ${sourceProfileId} page ${sourcePageId || "unknown"}`;
-      const payload = this.rewriteConfiguredReferences(editableFields(page, PAGE_FIELDS), mapping, report, context);
+      const payload = this.adaptPage(this.rewriteConfiguredReferences(editableFields(page, PAGE_FIELDS), mapping, report, context), context);
       const result = await this.#createPage(profileId, payload, report, context);
       const targetPageId = firstIdentifier(result?.page || result, "page_id", "id");
       if (!targetPageId) throw new Error(`Created profile page ${sourcePageId || "unknown"} did not return page_id`);

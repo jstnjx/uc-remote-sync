@@ -20,7 +20,10 @@ export const CAPABILITIES = Object.freeze([
   "sync_preview",
   "pin_pairing",
   "remote_install",
-  "purge_on_remove"
+  "purge_on_remove",
+  "proxy_state",
+  "persistent_link",
+  "hardware_adaptation"
 ]);
 
 export function protocolDescriptor(extra = {}) {

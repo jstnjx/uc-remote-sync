@@ -313,7 +313,7 @@ const SCRIPT = String.raw`
   const $ = (id) => document.getElementById(id);
   const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   const icon = (name) => '<span class="mi mi-' + name + '" aria-hidden="true"></span>';
-  const SECTION_LABELS = { resources: "Resources (icons, images)", entities: "Entities", activities: "Activities", activity_groups: "Activity groups", macros: "Macros", remotes: "Remote entities", profiles: "Profiles and pages", docks: "Docks (tunnelled)" };
+  const SECTION_LABELS = { resources: "Resources (icons, images)", entities: "Entities", activities: "Activities", activity_groups: "Activity groups", macros: "Macros", remotes: "Remote entities", profiles: "Profiles and pages", docks: "Docks (tunnelled)", settings: "Device settings (backlight, display, sound …)" };
   const state = { session: null, status: null, satellites: [], preview: null, settings: null, logs: [], logSeq: 0, selected: "primary", busy: new Set(), addMode: "pin" };
   let noticeTimer = null;
 
@@ -411,14 +411,23 @@ const SCRIPT = String.raw`
   }
 
   // ---------------------------------------------------------------- workspace
+  function setupNotice() {
+    if (!state.status || state.status.setup_finished !== false) return "";
+    return '<div class="notice warning"><span class="grow"><b>The integration setup on this remote is not finished.</b> Go back to the Remote Sync setup in the Web Configurator and press <b>Done</b>. If the setup dialog is closed or times out, the remote stops Remote Sync — Satellites then cannot start activities or control devices here.</span></div>';
+  }
+
   function wakeNotice() {
-    if (!state.status || state.status.wake_on_wlan !== false) return "";
+    if (!state.status || state.status.wake_on_wlan !== false) return setupNotice();
+    return setupNotice() + wakeNoticeHtml();
+  }
+
+  function wakeNoticeHtml() {
     return '<div class="notice warning"><span class="grow"><b>Wake on WLAN is off.</b> Remote Sync cannot reach this remote while it sleeps.</span>' + button("secondary small", "check", "Enable", 'data-act="wake"') + "</div>";
   }
 
   function roleChooser() {
-    return '<div class="empty-state"><span class="empty-icon">' + BRAND + "</span><h2>Choose this remote's role</h2>" +
-      "<p>Setup is complete. Decide whether this remote is the Primary that shares its configuration, or a Satellite that receives it. You can change this later in Settings.</p>" +
+    return setupNotice() + '<div class="empty-state"><span class="empty-icon">' + BRAND + "</span><h2>Choose this remote's role</h2>" +
+      "<p>Decide whether this remote is the Primary that shares its configuration, or a Satellite that receives it. You can change this later in Settings.</p>" +
       '<div class="role-choices">' +
       '<button class="role-choice" type="button" data-role="primary"><strong>' + icon("devices") + "Primary</strong><span>Shares activities, profiles, pages and entities with Satellites. Add Satellites by IP address and PIN.</span></button>" +
       '<button class="role-choice" type="button" data-role="satellite"><strong>' + icon("download") + "Satellite</strong><span>Receives the Primary's configuration. Adding it on the Primary by IP address and PIN also sets this role automatically.</span></button>" +
@@ -466,8 +475,22 @@ const SCRIPT = String.raw`
       '<div class="preview-layout"><div id="simSlot"></div><div class="preview-changes">' + previewBlock(p && p.peers, Boolean(p)) + "</div></div></section>";
   }
 
+  function linkOf(peerId) {
+    const entry = ((state.status && state.status.satellites) || []).find((x) => x.peer_id === peerId);
+    return (entry && entry.link) || { connected: false };
+  }
+
+  function hardwareText(hw) {
+    if (!hw) return "Unknown";
+    const parts = [hw.model || "Unknown model"];
+    if (hw.grid) parts.push(hw.grid.width + "×" + hw.grid.height + " screen grid");
+    if (hw.buttons) parts.push(hw.buttons.length + " buttons");
+    return parts.join(" · ");
+  }
+
   function satelliteDetail(sat) {
     const s = state.status;
+    const link = linkOf(sat.peer_id);
     const statusText = sat.updating ? "Updating" : sat.online ? (sat.enabled ? "Online" : "Online, disabled") : (sat.enabled ? "Offline" : "Disabled");
     const outdated = sat.version && sat.version !== "legacy" && cmpVersion(sat.version, s.version) < 0;
     const id = esc(encodeURIComponent(sat.peer_id));
@@ -484,6 +507,9 @@ const SCRIPT = String.raw`
       metric("Mirrored entities", esc(sat.mirrored_entities || 0)) + metric("Dock tunnels", esc(sat.dock_tunnels || 0)) + "</div>" +
       '<section class="overview-section"><div class="overview-section-head"><h3>Status</h3></div><dl class="kv">' +
       "<dt>Last result</dt><dd>" + esc(sat.last_sync_result || "—") + "</dd>" +
+      "<dt>Live link</dt><dd>" + (link.connected ? "Connected since " + esc(when(link.since)) : "Not connected (asleep or unreachable) — catches up automatically on reconnect") + "</dd>" +
+      "<dt>Hardware</dt><dd>" + esc(hardwareText(sat.hardware || link.hardware)) + "</dd>" +
+      (sat.last_drift_at ? "<dt>Local edits reverted</dt><dd>" + esc(when(sat.last_drift_at)) + " · " + esc((sat.last_drift || []).map((x) => x.kind + " " + (x.id || "")).join(", ")) + "</dd>" : "") +
       "<dt>Agent</dt><dd class=\"mono\">" + esc(sat.url || "Discovering…") + "</dd>" +
       "<dt>Network</dt><dd class=\"mono\">" + esc((sat.mac || "MAC unknown") + " · " + ((sat.broadcasts || []).join(", ") || "broadcast unknown")) + "</dd>" +
       (sat.last_update_result ? "<dt>Update</dt><dd>" + esc(sat.last_update_result) + "</dd>" : "") +
@@ -502,7 +528,12 @@ const SCRIPT = String.raw`
       '<div class="overview-metrics">' + metric("Primary", esc(pairing.paired_master_name || "Not paired")) + metric("Paired", when(pairing.paired_at)) +
       metric("Mirrored entities", esc(s.proxy_count || 0)) + metric("Last apply", when(s.status.last_sync_at)) + "</div>" +
       (paired
-        ? '<section class="overview-section"><div class="overview-section-head"><h3>Synchronization</h3></div><dl class="kv"><dt>Last result</dt><dd>' + esc(s.status.last_sync_result || "—") + "</dd><dt>Agent</dt><dd class=\"mono\">" + esc(s.agent_url || "") + "</dd></dl></section>"
+        ? '<section class="overview-section"><div class="overview-section-head"><h3>Synchronization</h3></div><dl class="kv"><dt>Last result</dt><dd>' + esc(s.status.last_sync_result || "—") + "</dd>" +
+          "<dt>Live link</dt><dd>" + (s.link && s.link.connected ? "Connected to the Primary since " + esc(when(s.link.connected_at)) : "Not connected" + (s.link && s.link.last_error ? " (" + esc(s.link.last_error) + ")" : "") + " — retrying") + "</dd>" +
+          "<dt>Hardware</dt><dd>" + esc(hardwareText(s.hardware)) + "</dd>" +
+          ((s.status.last_hardware_adjustments || []).length ? "<dt>Adapted to this remote</dt><dd>" + (s.status.last_hardware_adjustments || []).map(esc).join("<br>") + "</dd>" : "") +
+          (s.drift && s.drift.last_drift ? "<dt>Local edits reverted</dt><dd>" + esc(when(s.drift.last_drift.detected_at)) + " · " + esc(s.drift.last_drift.objects.map((x) => x.kind + " " + (x.id || "")).join(", ")) + " (backups kept on this remote)</dd>" : "") +
+          "<dt>Agent</dt><dd class=\"mono\">" + esc(s.agent_url || "") + "</dd></dl></section>"
         : '<section class="overview-section"><div class="overview-section-head"><h3>Pair with the Primary</h3></div>' +
           '<p style="margin-top:var(--space-4)">On the Primary\'s dashboard choose <b>Add satellite</b> and enter this remote\'s IP address and Web Configurator PIN. Remote Sync on this remote is updated and paired automatically.</p>' +
           '<p style="margin:var(--space-4) 0 var(--space-2)">Pairing token for Primaries on Remote Sync 0.8 or older:</p>' +
@@ -884,7 +915,9 @@ const SCRIPT = String.raw`
         sw("use_standby_inhibitor", "Keep satellites awake while applying", sync.use_standby_inhibitor) +
         sw("verify_existing_resource_hashes", "Verify existing resource hashes", sync.verify_existing_resource_hashes, "Slower; repairs damaged icons and images") +
         field("interval_seconds", "Periodic check interval (seconds)", sync.interval_seconds, 'type="number" min="300" max="86400" step="60"') + "</div>" +
-        '<div class="sections-grid">' + (sync.available_sections || []).map((name) => '<label class="switch-row"><input type="checkbox" name="section" value="' + name + '"' + ((sync.sections || []).includes(name) ? " checked" : "") + '><span class="switch"></span><span>' + esc(SECTION_LABELS[name] || name) + "</span></label>").join("") + "</div></div>" +
+        '<div class="sections-grid">' + (sync.available_sections || []).map((name) => '<label class="switch-row"><input type="checkbox" name="section" value="' + name + '"' + ((sync.sections || []).includes(name) ? " checked" : "") + '><span class="switch"></span><span>' + esc(SECTION_LABELS[name] || name) + "</span></label>").join("") + "</div>" +
+        '<div class="settings-subgroup" id="settingsCategories"' + ((sync.sections || []).includes("settings") ? "" : " hidden") + '><p style="font-size:12px;margin:var(--space-3) 0 var(--space-2)">Device settings to keep identical on every remote. Satellites take these from the Primary; changing them on a Satellite is undone. Name, Wi-Fi, Bluetooth and the admin PIN are never synchronized.</p><div class="sections-grid">' +
+        (sync.available_settings_categories || []).map((item) => '<label class="switch-row"><input type="checkbox" name="settings_category" value="' + esc(item.id) + '"' + ((sync.settings_categories || []).includes(item.id) ? " checked" : "") + '><span class="switch"></span><span>' + esc(item.label) + "</span></label>").join("") + "</div></div></div>" +
         '<div class="settings-group"><h3>Docks</h3><label class="field"><span>Physical Dock API token(s)</span><textarea name="dock_tokens" placeholder="One token for all Docks, or one DOCK_ID=token per line"></textarea><small>' +
         (s.docks.default_token_set || s.docks.dock_ids.length ? "Stored: " + (s.docks.default_token_set ? "default token" : "") + (s.docks.dock_ids.length ? (s.docks.default_token_set ? ", " : "") + esc(s.docks.dock_ids.join(", ")) : "") + ". Leave empty to keep." : "Needed for Dock synchronization.") + "</small></label>" +
         (s.docks.default_token_set || s.docks.dock_ids.length ? sw("clear_dock_tokens", "Remove stored Dock tokens", false) : "") + "</div>";
@@ -896,6 +929,8 @@ const SCRIPT = String.raw`
         '<div>' + button("secondary danger small", "delete", "Reset role", 'data-reset-role="1"') + "</div></div>";
     }
     $("settingsBody").innerHTML = html;
+    const settingsToggle = $("settingsBody").querySelector('input[name="section"][value="settings"]');
+    if (settingsToggle) settingsToggle.addEventListener("change", () => { $("settingsCategories").hidden = !settingsToggle.checked; });
     $("settingsDialog").showModal();
   }
   $("settingsButton").addEventListener("click", openSettings);
@@ -911,7 +946,7 @@ const SCRIPT = String.raw`
     const form = $("settingsForm"); const data = new FormData(form); const s = state.settings;
     const body = { node_name: data.get("node_name"), agent_public_url: data.get("agent_public_url"), mac_override: data.get("mac_override"), broadcast_overrides: data.get("broadcast_overrides") };
     if (s.role === "primary") {
-      Object.assign(body, { sections: data.getAll("section"), interval_seconds: Number(data.get("interval_seconds")) });
+      Object.assign(body, { sections: data.getAll("section"), settings_categories: data.getAll("settings_category"), interval_seconds: Number(data.get("interval_seconds")) });
       for (const key of ["auto_sync", "auto_update_satellites", "prune", "use_standby_inhibitor", "verify_existing_resource_hashes"]) body[key] = data.get(key) === "on";
       if (String(data.get("dock_tokens") || "").trim()) body.dock_tokens = data.get("dock_tokens");
       if (data.get("clear_dock_tokens") === "on") body.clear_dock_tokens = true;

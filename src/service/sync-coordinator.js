@@ -18,7 +18,8 @@ export class SyncCoordinator {
     getStatus,
     discovery,
     setDockCatalog,
-    initializeActivityStates
+    initializeActivityStates,
+    onSnapshotBuilt = null
   }) {
     this.getConfig = getConfig;
     this.getClient = getClient;
@@ -26,6 +27,7 @@ export class SyncCoordinator {
     this.discovery = discovery;
     this.setDockCatalog = setDockCatalog;
     this.initializeActivityStates = initializeActivityStates;
+    this.onSnapshotBuilt = onSnapshotBuilt;
     this.cache = null;
   }
 
@@ -45,6 +47,7 @@ export class SyncCoordinator {
     this.setDockCatalog(docks);
     log.info(`Snapshot ${snapshot.manifest.operation_id} built (${snapshot.payload.length} bytes, hash ${snapshot.manifest.content_hash.slice(0, 12)})`);
     this.cache = snapshot;
+    try { this.onSnapshotBuilt?.(snapshot.manifest); } catch (error) { log.warn("Snapshot listener failed:", error.message); }
     return snapshot;
   }
 

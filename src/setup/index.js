@@ -205,7 +205,7 @@ export class SetupFlow {
         ? { en: `The API key was renewed. Manage Remote Sync in the dashboard:${link}`, de: `Der API-Schlüssel wurde erneuert. Verwalte Remote Sync im Dashboard:${link}` }
         : { en: `Choose whether this remote is the Primary or a Satellite in the dashboard:${link}`, de: `Lege im Dashboard fest, ob diese Fernbedienung Primary oder Satellit ist:${link}` },
       undefined,
-      { en: `Sign in with this remote's Web Configurator PIN. ${wake.en}`, de: `Melde dich mit der Web-Konfigurator-PIN dieser Fernbedienung an. ${wake.de}` }
+      { en: `Press Done now to finish the setup — if this dialog is closed or times out, the remote stops Remote Sync. Then sign in to the dashboard with this remote's Web Configurator PIN. ${wake.en}`, de: `Schließe die Einrichtung jetzt mit Fertig ab — wird dieser Dialog geschlossen oder läuft ab, beendet die Fernbedienung Remote Sync. Melde dich danach mit der Web-Konfigurator-PIN dieser Fernbedienung im Dashboard an. ${wake.de}` }
     );
   }
 }

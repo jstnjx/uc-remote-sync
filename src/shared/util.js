@@ -125,18 +125,36 @@ export function usableIpv4(value) {
   return octets[0] !== 0 && octets[0] !== 127 && octets[0] < 224 && !octets.every((part) => part === 255);
 }
 
-export function firstLanIpv4() {
-  for (const entries of Object.values(os.networkInterfaces())) {
+// Container and VPN bridges are never the address a Remote on the LAN can reach.
+const VIRTUAL_INTERFACE = /^(docker|br-|veth|virbr|cni|flannel|cali|tun|tap|wg|zt|tailscale|lxc|lxd)/i;
+
+export function localIpv4Addresses(interfaces = os.networkInterfaces()) {
+  const physical = [];
+  const virtual = [];
+  for (const [name, entries] of Object.entries(interfaces || {})) {
     for (const item of entries || []) {
-      if (item.family === "IPv4" && !item.internal && usableIpv4(item.address)) return item.address;
+      if (item.family !== "IPv4" && item.family !== 4) continue;
+      if (item.internal || !usableIpv4(item.address)) continue;
+      (VIRTUAL_INTERFACE.test(name) ? virtual : physical).push(item.address);
     }
   }
-  return null;
+  return [...physical, ...virtual];
 }
 
-export function reachableAgentUrl(config) {
+export function firstLanIpv4(interfaces = os.networkInterfaces()) {
+  return localIpv4Addresses(interfaces)[0] || null;
+}
+
+// URL under which Satellites reach this instance's agent. The agent runs on this machine, so the address must be one
+// of its own: the configured Remote address only qualifies when Remote Sync runs on that Remote. An external Primary
+// (Docker, Node.js) previously advertised the Primary Remote's address here, so Satellites sent proxied commands and
+// activity starts to a host where no agent was listening.
+export function reachableAgentUrl(config, { interfaces = os.networkInterfaces(), env = process.env } = {}) {
   if (!config) return null;
   if (config.agent_public_url) return String(config.agent_public_url).replace(/\/$/, "");
-  const host = usableIpv4(config.remote?.host) ? config.remote.host : firstLanIpv4();
+  const local = localIpv4Addresses(interfaces);
+  const advertised = String(env.UC_MDNS_ADDRESS || "").split(",").map((item) => item.trim()).find(usableIpv4);
+  const remoteHost = usableIpv4(config.remote?.host) && local.includes(config.remote.host) ? config.remote.host : null;
+  const host = advertised || remoteHost || local[0] || null;
   return host ? `http://${host}:${Number(config.agent_port || 11081)}` : null;
 }

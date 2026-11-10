@@ -1,7 +1,9 @@
+import { normalizeSettingsCategories } from "../settings/catalog.js";
 import net from "node:net";
 import {
   DEFAULT_AGENT_PORT,
   DEFAULT_SECTIONS,
+  SUPPORTED_SECTIONS,
   DEFAULT_SYNC_INTERVAL_SECONDS,
   DEFAULT_VIRTUAL_DOCK_PORT,
   SCHEMA_VERSION
@@ -158,7 +160,7 @@ export function normalizeAndValidateConfig(input) {
   if (!role) errors.push("role must be master, child or unassigned");
 
   const sourceSections = Array.isArray(sync.sections) ? sync.sections.map(text) : [...DEFAULT_SECTIONS];
-  const sections = [...new Set(sourceSections.filter((item) => DEFAULT_SECTIONS.includes(item)))];
+  const sections = [...new Set(sourceSections.filter((item) => SUPPORTED_SECTIONS.includes(item)))];
   if (!sections.length) errors.push("sync.sections must enable at least one supported section");
 
   const pairingSource = data.pairing && typeof data.pairing === "object" ? data.pairing : {};
@@ -223,6 +225,7 @@ export function normalizeAndValidateConfig(input) {
     peers: Array.isArray(data.peers) ? data.peers.map((item, index) => normalizePeer(item, index, errors)) : [],
     sync: {
       sections,
+      settings_categories: normalizeSettingsCategories(sync.settings_categories),
       interval_seconds: Math.max(300, Math.min(86_400, Number.isFinite(interval) ? interval : DEFAULT_SYNC_INTERVAL_SECONDS)),
       auto_sync: sync.auto_sync !== false,
       prune: sync.prune === true,

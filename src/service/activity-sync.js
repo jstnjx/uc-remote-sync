@@ -8,7 +8,11 @@ const log = logger("activity-sync");
 // -----------------------------------------------------------------------------
 
 export class ActivitySyncManager {
-  constructor({ getConfig, getClient, getMappings, resolvePeerUrl, forwardProxyCommand }) {
+  constructor({ getConfig, getClient, getMappings, resolvePeerUrl, forwardProxyCommand, publish = null, linkedPeer = () => false }) {
+    this.publish = publish;
+    this.linkedPeer = linkedPeer;
+    this.activityIds = new Set();
+    this.lastChangeAt = new Map();
     this.getConfig = getConfig;
     this.getClient = getClient;
     this.getMappings = getMappings;
@@ -30,6 +34,33 @@ export class ActivitySyncManager {
     this.applyQueues.clear();
     this.lastObservedStates.clear();
     this.lastPushedStates.clear();
+    this.lastChangeAt.clear();
+  }
+
+  // Activities of the latest snapshot (Primary).
+  setActivities(records) {
+    this.activityIds = new Set((records || []).map((record) => String(record?.source_id || "")).filter(Boolean));
+  }
+
+  // When the Primary last saw this activity change state (ms since epoch), for "newest action wins".
+  lastChange(sourceActivityId) { return this.lastChangeAt.get(String(sourceActivityId)) || 0; }
+
+  // Current state of every synchronized activity, read from the Primary's Core (full link image).
+  async currentUpdates() {
+    const client = this.getClient();
+    if (!client) return [];
+    const updates = [];
+    for (const sourceActivityId of this.activityIds) {
+      let state = this.lastObservedStates.get(sourceActivityId) || null;
+      if (!state) {
+        try {
+          const detail = await client.getJson(`/activities/${encodeURIComponent(sourceActivityId)}`, { optionalStatuses: [404], wakeOnUnavailable: false });
+          state = detail?.attributes?.state ?? detail?.state ?? null;
+        } catch (error) { log.debug(`Could not read activity ${sourceActivityId}: ${error.message}`); }
+      }
+      if (typeof state === "string" && this.#actionFromState(state)) updates.push(this.#stateUpdate(sourceActivityId, state));
+    }
+    return updates;
   }
 
   #actionFromState(state) {
@@ -129,8 +160,10 @@ export class ActivitySyncManager {
     const normalizedState = String(state).trim().toUpperCase();
     if (this.lastObservedStates.get(sourceActivityId) === normalizedState) return;
     this.lastObservedStates.set(sourceActivityId, normalizedState);
+    this.lastChangeAt.set(sourceActivityId, Date.now());
     const update = this.#stateUpdate(sourceActivityId, state);
-    const peers = config.peers.filter((peer) => peer.enabled);
+    this.publish?.(update);
+    const peers = config.peers.filter((peer) => peer.enabled && !this.linkedPeer(peer));
     for (const peer of peers) {
       try {
         await this.#push(peer, update);
@@ -140,7 +173,17 @@ export class ActivitySyncManager {
     }
   }
 
+  // Re-announce the Primary's current state of one activity (after a Satellite action lost to a newer change).
+  republish(sourceActivityId) {
+    const state = this.lastObservedStates.get(String(sourceActivityId));
+    if (!state) return null;
+    const update = this.#stateUpdate(String(sourceActivityId), state);
+    this.publish?.(update);
+    return update;
+  }
+
   async initialize(peer, activities) {
+    if (this.linkedPeer(peer)) return;
     for (const record of activities || []) {
       const sourceActivityId = String(record?.source_id || "");
       const state = record?.detail?.attributes?.state ?? record?.detail?.state;
@@ -219,6 +262,6 @@ export class ActivitySyncManager {
       return { success: true, suppressed: true, source_entity_id: source, cmd_id: `activity.${normalizedAction}` };
     }
     this.relaySuppressions.delete(key);
-    return this.forwardProxyCommand(source, `activity.${normalizedAction}`);
+    return this.forwardProxyCommand(source, `activity.${normalizedAction}`, undefined, { issuedAt: Date.now() });
   }
 }

@@ -42,6 +42,7 @@ export class Driver {
     this.api.on(uc.Events.ExitStandby, () => { log.debug("Host remote exited standby; reconciling Core state"); this.service.reconcile(); });
     this.api.on(uc.Events.SubscribeEntities, (entityIds) => this.entities.refreshSubscribed(entityIds));
     this.api.on("remote_info", (info) => this.service.setRemoteInfo(info));
+    this.service.setRuntimeInfoProvider(() => this.api.getRuntimeInfo(null, 2000));
   }
   async start() {
     const port = Number(process.env.UC_INTEGRATION_HTTP_PORT || DEFAULT_INTEGRATION_PORT);

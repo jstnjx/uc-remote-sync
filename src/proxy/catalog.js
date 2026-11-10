@@ -27,7 +27,7 @@ function language(value, fallback) {
   return { en: fallback };
 }
 
-function safeAttributes(value) {
+export function safeAttributes(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return { state: "UNKNOWN" };
   const result = {};
   for (const [key, item] of Object.entries(value)) {
@@ -136,11 +136,18 @@ function activationDescriptor(item) {
 }
 
 function capabilityDescriptor(item) {
+  // `kind` and `editable` were sent by earlier releases and dropped by the Core; ignoring them keeps proxy ids stable.
+  let options = item.options;
+  if (options && typeof options === "object" && !Array.isArray(options) && ("kind" in options || "editable" in options)) {
+    options = { ...options };
+    delete options.kind;
+    delete options.editable;
+  }
   return Object.fromEntries(Object.entries({
     entity_type: item.entity_type,
     features: Array.isArray(item.features) ? [...item.features].map(String).sort() : [],
     device_class: item.device_class,
-    options: item.options
+    options
   }).filter(([, value]) => value !== undefined));
 }
 
@@ -210,7 +217,7 @@ function preserveOrReviseIdentity(descriptor, previousBySource) {
   return descriptor;
 }
 
-export function buildProxyCatalog(manifest, previousCatalog = null) {
+export function buildProxyCatalog(manifest, previousCatalog = null, { adaptRemoteOptions = null } = {}) {
   const referencedCommands = collectReferencedCommands(manifest?.data || {});
   const previousBySource = new Map((previousCatalog?.entities || [])
     .filter((item) => item?.source_entity_id)
@@ -226,10 +233,14 @@ export function buildProxyCatalog(manifest, previousCatalog = null) {
   for (const record of manifest?.data?.remotes || []) {
     const detail = record?.detail || {};
     const options = { ...(detail.options && typeof detail.options === "object" ? detail.options : {}) };
+    // Core-internal options of a remote entity; an integration may not set them (the Core strips them with a warning).
+    delete options.kind;
+    delete options.editable;
     if (Array.isArray(detail.simple_commands)) options.simple_commands = detail.simple_commands;
     if (record?.buttons !== undefined) options.button_mapping = record.buttons;
     if (record?.ui !== undefined) options.user_interface = record.ui;
-    const descriptor = proxyDescriptor({ ...detail, options }, { sourceId: record?.source_id, forceType: "remote" });
+    const adapted = adaptRemoteOptions ? adaptRemoteOptions(options, `remote ${record?.source_id || "unknown"}`) : options;
+    const descriptor = proxyDescriptor({ ...detail, options: adapted }, { sourceId: record?.source_id, forceType: "remote" });
     if (descriptor) {
       augmentReferencedCapabilities(descriptor, referencedCommands.get(descriptor.source_entity_id));
       descriptors.set(descriptor.source_entity_id, preserveOrReviseIdentity(descriptor, previousBySource));

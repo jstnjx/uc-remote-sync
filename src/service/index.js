@@ -20,15 +20,39 @@ import { SatellitePurger } from "../apply/purge.js";
 import { SatelliteManager } from "./satellite-manager.js";
 import { SyncCoordinator } from "./sync-coordinator.js";
 import { ActivitySyncManager } from "./activity-sync.js";
+import { proxyAttributes, ProxyStateRelay } from "./state-relay.js";
+import { DriftGuard } from "./drift-guard.js";
+import { LinkHub } from "../link/hub.js";
+import { LinkClient } from "../link/client.js";
+import { HardwareAdapter, readHardwareProfile } from "../apply/hardware.js";
+import { applyDeviceSettings } from "../apply/settings.js";
+import { SETTINGS_CATEGORIES, extractSettings, normalizeSettingsCategories, settingsFingerprint } from "../settings/catalog.js";
 import { provisionSatelliteByPin, revokeManagementKey } from "./satellite-provisioner.js";
 import { inspectManualSatellite } from "../setup/manual-satellite.js";
 import { networkOverrides, physicalDockTokens } from "../setup/common.js";
 import { detectRemoteNetworkIdentity } from "../network/identity.js";
 import { isPairingIdentifier } from "../pairing/config.js";
 import { createUiHandler } from "../web/server.js";
-import { APP_VERSION, DEFAULT_SECTIONS } from "../shared/constants.js";
+import { APP_VERSION, DEFAULT_SECTIONS, SUPPORTED_SECTIONS } from "../shared/constants.js";
 
 const log = logger("service");
+const DRIFT_RESYNC_INTERVAL_MS = 5 * 60_000;
+
+// Command ids reach the Primary in two spellings: qualified ("light.on", "activity.on") from Remote Sync itself and
+// short ("on") from the Satellite's Integration API. The Core REST API takes the qualified form; the short form is
+// kept as a fallback for Cores that accept it.
+// Converts the age of an action reported by a Satellite into this node's clock.
+export function ageToTime(ageMs) {
+  const age = Number(ageMs);
+  return Number.isFinite(age) && age >= 0 ? Date.now() - age : null;
+}
+
+export function proxyCommandCandidates(cmdId, entityType = null) {
+  const command = String(cmdId || "").trim();
+  const type = String(entityType || "").trim().toLowerCase();
+  if (!command || command.includes(".") || !/^[a-z_]+$/.test(type)) return [command];
+  return [`${type}.${command}`, command];
+}
 
 // -----------------------------------------------------------------------------
 // Remote Sync service
@@ -73,14 +97,39 @@ export class RemoteSyncService {
       getStatus: () => this.status,
       discovery: this.discovery,
       setDockCatalog: (catalog) => { this.masterDockCatalog = catalog; },
-      initializeActivityStates: (peer, activities) => this.activitySync.initialize(peer, activities)
+      initializeActivityStates: async (peer, activities) => {
+        await this.activitySync.initialize(peer, activities);
+        await this.stateRelay.initialize(peer);
+      },
+      onSnapshotBuilt: (manifest) => {
+        this.stateRelay.setSnapshot(manifest);
+        this.activitySync.setActivities(manifest?.data?.activities);
+        if (manifest?.data?.settings) this.settingsFingerprint = settingsFingerprint(manifest.data.settings);
+      }
     });
+    this.linkHub = null;
+    this.link = null;
+    this.driftGuard = null;
+    this.peerSyncTimers = new Map();
+    this.driftSyncAt = new Map();
+    this.hardwareProfile = null;
+    this.stateRelay = new ProxyStateRelay({
+      getConfig: () => this.config,
+      getClient: () => this.client,
+      resolvePeerUrl: (peer, force) => this.syncCoordinator.resolvePeerUrl(peer, force),
+      publish: (states) => this.linkHub?.publish("state", { states }),
+      linkedPeer: (peer) => this.#linkedPeer(peer)
+    });
+    this.proxyStateListeners = [];
+    this.proxySaveTimer = null;
     this.activitySync = new ActivitySyncManager({
       getConfig: () => this.config,
       getClient: () => this.client,
       getMappings: () => this.mappings,
       resolvePeerUrl: (peer, force) => this.syncCoordinator.resolvePeerUrl(peer, force),
-      forwardProxyCommand: (sourceEntityId, cmdId, params) => this.forwardProxyCommand(sourceEntityId, cmdId, params)
+      forwardProxyCommand: (sourceEntityId, cmdId, params, options) => this.forwardProxyCommand(sourceEntityId, cmdId, params, options),
+      publish: (update) => this.linkHub?.publish("activity", { update }),
+      linkedPeer: (peer) => this.#linkedPeer(peer)
     });
     this.satelliteManager = new SatelliteManager({
       getConfig: () => this.config,
@@ -95,6 +144,7 @@ export class RemoteSyncService {
 
   addStatusListener(listener) { this.listeners.push(listener); }
   addProxyListener(listener) { this.proxyListeners.push(listener); }
+  addProxyStateListener(listener) { this.proxyStateListeners.push(listener); }
   async load() {
     try {
       const config = this.store.load();
@@ -133,6 +183,7 @@ export class RemoteSyncService {
     }
     this.discovery.clear();
     this.client = new CoreClient(config.remote);
+    if (config.role === "master") this.linkHub = this.createLinkHub();
     this.status = createStatus("starting");
     if (config.role === "child") {
       this.virtualDockServer = new VirtualDockServer(config);
@@ -151,6 +202,12 @@ export class RemoteSyncService {
       satelliteActionCallback: (peerId, action) => this.satelliteManager.action(peerId, action),
       commandCallback: (command) => this.executeProxyCommand(command),
       activityStateCallback: (update) => this.activitySync.apply(update),
+      proxyStateCallback: (states) => this.applyProxyStates(states),
+      proxyStatesCallback: () => this.stateRelay.currentStates(),
+      linkCallback: ({ socket, peer }) => {
+        if (!this.linkHub) throw new Error("This node is not an active primary");
+        this.linkHub.attach(socket, peer);
+      },
       dockTunnelCallback: (request) => this.openDockTunnel(request),
       pinPairingCallback: (coreKey) => this.pinPair(coreKey),
       uiHandler: this.uiHandler
@@ -164,15 +221,19 @@ export class RemoteSyncService {
     } catch (error) { this.status.state = `unreachable: ${error.message}`; }
     if (config.role === "master") {
       this.watcher = new CoreEventWatcher(config.remote, (events) => this.#configurationEvents(events), {
+        configurationFilter: (name, data) => name !== "configuration_change" || this.#settingsChanged(data?.new_state),
         activityStateCallback: (event) => this.activitySync.broadcast(event),
+        entityStateCallback: (event) => this.stateRelay.handle(event),
         reconnectCallback: async () => { this.status.pending_changes = true; this.configurationRevision += 1; this.syncCoordinator.invalidateCache(); this.#scheduleEventSync(); }
       });
       this.watcherTask = this.watcher.run().catch((error) => log.error("Event watcher stopped:", error));
+      this.#loadRelaySources().catch((error) => log.debug("Could not prepare the live state relay:", error.message));
       if (config.sync.auto_sync) {
         this.#scheduleInitialSync();
         this.#schedulePeriodic();
       }
     }
+    if (config.role === "child" && config.pairing?.paired_master_id) this.#startSatelliteLink();
     this.#notify();
   }
 
@@ -186,10 +247,17 @@ export class RemoteSyncService {
     for (const timer of this.retryTimers.values()) clearTimeout(timer); this.retryTimers.clear();
     for (const close of this.dockTunnelSessions) close();
     this.dockTunnelSessions.clear();
+    this.linkHub?.close(); this.linkHub = null;
+    this.link?.stop(); this.link = null;
     await this.agent?.stop(); this.agent = null;
     await this.virtualDockServer?.stop(); this.virtualDockServer = null;
     this.masterDockCatalog.clear();
     this.activitySync.clear();
+    this.stateRelay.clear();
+    this.driftGuard?.stop(); this.driftGuard = null;
+    for (const timer of this.peerSyncTimers.values()) clearTimeout(timer); this.peerSyncTimers.clear();
+    clearTimeout(this.proxyStateRefreshTimer); this.proxyStateRefreshTimer = null;
+    this.#flushProxySave();
     try { await this.client?.close?.(); } catch (error) { log.debug("Core client close failed:", error.message); }
     this.client = null;
   }
@@ -270,7 +338,7 @@ export class RemoteSyncService {
       const snapshot = this.syncCoordinator.cachedSnapshot();
       if (!snapshot) { this.status.pending_changes = true; this.#scheduleEventSync(); return; }
       const result = await this.syncCoordinator.pushSnapshot(peer, snapshot.payload);
-      if (result.success) { this.satelliteManager.record(peerId, { online: true, last_error: null, last_applied_hash: snapshot.manifest.content_hash, last_attempted_hash: snapshot.manifest.content_hash, consecutive_failures: 0, next_retry_at: null, last_seen_at: utcNow() }); }
+      if (result.success) { this.stateRelay.initialize(peer).catch(() => {}); this.satelliteManager.record(peerId, { online: true, last_error: null, last_applied_hash: snapshot.manifest.content_hash, last_attempted_hash: snapshot.manifest.content_hash, consecutive_failures: 0, next_retry_at: null, last_seen_at: utcNow() }); }
       else { const nextFailures = failures + 1; this.satelliteManager.record(peerId, { online: false, last_error: result.error || result.report?.error || "Synchronization failed", last_attempted_hash: snapshot.manifest.content_hash, consecutive_failures: nextFailures }); this.#schedulePeerRetry(peerId); }
     }, delay); timer.unref?.(); this.retryTimers.set(peerId, timer);
   }
@@ -279,6 +347,180 @@ export class RemoteSyncService {
     const memory = process.memoryUsage(); const eventLoopMs = Number(this.eventLoopDelay.mean || 0) / 1e6;
     Object.assign(this.status.telemetry, { rss_bytes: memory.rss, heap_used_bytes: memory.heapUsed, event_loop_delay_ms: Math.round(eventLoopMs) });
     return memory.rss < MAX_AUTO_SYNC_RSS_BYTES && eventLoopMs < MAX_EVENT_LOOP_DELAY_MS;
+  }
+
+  // A configuration_change event carries every system setting; only a change of a synchronized one is relevant.
+  #settingsChanged(cfgAll) {
+    if (!this.config?.sync?.sections?.includes("settings") || !cfgAll) return false;
+    const fingerprint = settingsFingerprint(extractSettings(cfgAll, this.config.sync.settings_categories));
+    if (fingerprint === this.settingsFingerprint) return false;
+    // Unknown before the first snapshot: treat as changed; the snapshot's change hash decides whether anything is sent.
+    this.settingsFingerprint = fingerprint;
+    return true;
+  }
+
+  // -------------------------------------------------------------------------
+  // Persistent link
+  // -------------------------------------------------------------------------
+
+  // A Satellite that can hold a link gets live updates only over it; while it is disconnected (asleep) it catches up
+  // when it reconnects, so the Primary does not try to reach it over HTTP for every change.
+  #linkedPeer(peer) {
+    if (!peer) return false;
+    if (this.linkHub?.isConnected(peer.peer_id)) return true;
+    return Array.isArray(peer.protocol?.capabilities) && peer.protocol.capabilities.includes("persistent_link");
+  }
+
+  createLinkHub() {
+    return new LinkHub({
+      fullState: async () => ({ states: await this.stateRelay.currentStates(), activities: await this.activitySync.currentUpdates() }),
+      onCommand: (peer, message) => this.executeProxyCommand({
+        source_entity_id: String(message.source_entity_id || ""),
+        cmd_id: String(message.cmd_id || ""),
+        params: message.params || undefined,
+        entity_type: message.entity_type || null,
+        issued_at: ageToTime(message.issued_age_ms),
+        via: peer.name || peer.peer_id
+      }),
+      onActivityRelay: (peer, message) => this.executeProxyCommand({
+        source_entity_id: String(message.source_activity_id || ""),
+        cmd_id: `activity.${String(message.action || "").toLowerCase()}`,
+        issued_at: ageToTime(message.issued_age_ms),
+        via: peer.name || peer.peer_id
+      }),
+      onDrift: (peer, message) => {
+        const objects = Array.isArray(message.objects) ? message.objects : [];
+        log.warn(`${peer.name || peer.peer_id} reports ${objects.length} local edit(s) of synchronized configuration; restoring the Primary's version`);
+        this.satelliteManager.record(peer.peer_id, { last_drift_at: utcNow(), last_drift: objects.slice(0, 20) });
+        // Something other than a person (for example the Core reacting to a missing device) could keep changing an
+        // object; restore at most once every few minutes so that can never turn into a synchronization loop.
+        const last = this.driftSyncAt.get(peer.peer_id) || 0;
+        const wait = Math.max(0, last + DRIFT_RESYNC_INTERVAL_MS - Date.now());
+        this.driftSyncAt.set(peer.peer_id, Date.now() + wait);
+        if (wait) log.warn(`Restoring ${peer.name || peer.peer_id} in ${Math.round(wait / 1000)}s (repeated local edits are throttled)`);
+        setTimeout(() => this.#queuePeerSync(peer.peer_id, "local edits on the Satellite", { fresh: true }), wait).unref?.();
+      },
+      onHello: (peer, message) => {
+        // Configuration is compared by its change hash, which ignores live state: comparing content hashes would
+        // re-send the whole configuration on every wake-up because device states always differ.
+        const appliedChange = typeof message.applied_change_hash === "string" ? message.applied_change_hash : null;
+        const applied = typeof message.applied_content_hash === "string" ? message.applied_content_hash : null;
+        this.satelliteManager.record(peer.peer_id, {
+          online: true,
+          last_seen_at: utcNow(),
+          version: message.version || undefined,
+          hardware: message.hardware || null,
+          link_connected_at: utcNow()
+        });
+        const manifest = this.syncCoordinator.cachedSnapshot()?.manifest;
+        const currentChange = manifest?.change_hash || this.status.last_change_hash || null;
+        const currentContent = manifest?.content_hash || this.status.last_snapshot_hash || null;
+        const outdated = appliedChange && currentChange ? appliedChange !== currentChange
+          : (!applied && !appliedChange) ? Boolean(currentChange || currentContent)
+            : Boolean(currentContent && applied !== currentContent);
+        if (outdated) this.#queuePeerSync(peer.peer_id, applied || appliedChange ? "configuration changed while the Satellite was away" : "Satellite has no configuration yet");
+      }
+    });
+  }
+
+  // Bring one Satellite up to date: on reconnect with an outdated configuration, or to undo local edits (fresh = build a
+  // new snapshot so the Satellite applies it even if it saw the same content before).
+  #queuePeerSync(peerId, reason, { fresh = false } = {}) {
+    if (this.peerSyncTimers.has(peerId)) return;
+    const timer = setTimeout(async () => {
+      this.peerSyncTimers.delete(peerId);
+      const peer = this.config?.peers?.find((item) => item.peer_id === peerId && item.enabled);
+      if (!peer || this.config?.role !== "master") return;
+      if (this.syncing) { this.#queuePeerSync(peerId, reason, { fresh }); return; }
+      log.info(`Synchronizing ${peer.name || peerId}: ${reason}`);
+      this.syncing = true;
+      try {
+        const cached = this.syncCoordinator.cachedSnapshot();
+        const snapshot = !fresh && cached ? cached : await this.syncCoordinator.buildSnapshot({ force: true });
+        const result = await this.syncCoordinator.pushSnapshot(peer, snapshot.payload);
+        if (result.success) {
+          await this.activitySync.initialize(peer, snapshot.manifest.data.activities || []);
+          await this.stateRelay.initialize(peer);
+        }
+        this.satelliteManager.record(peerId, {
+          online: Boolean(result.success),
+          last_sync_at: utcNow(),
+          last_sync_result: result.success ? `Synchronized (${reason})` : (result.error || "Synchronization failed"),
+          last_error: result.success ? null : (result.error || result.report?.error || "Synchronization failed"),
+          last_applied_hash: result.success ? snapshot.manifest.content_hash : undefined,
+          last_attempted_hash: snapshot.manifest.content_hash
+        });
+        if (!result.success) this.#schedulePeerRetry(peerId);
+      } catch (error) {
+        log.warn(`Synchronizing ${peer.name || peerId} failed:`, error.message);
+        this.#schedulePeerRetry(peerId);
+      } finally {
+        this.syncing = false;
+        this.#notify();
+      }
+    }, 3000);
+    timer.unref?.();
+    this.peerSyncTimers.set(peerId, timer);
+  }
+
+  #stopSatelliteLink() {
+    this.link?.stop(); this.link = null;
+    this.driftGuard?.stop(); this.driftGuard = null;
+    const watcher = this.watcher;
+    this.watcher = null;
+    watcher?.stop();
+    this.watcherTask = null;
+  }
+
+  #startSatelliteLink() {
+    const sourceNode = () => this.config?.pairing?.paired_master_id || null;
+    this.driftGuard = new DriftGuard({
+      getClient: () => this.client,
+      getMappings: () => this.mappings,
+      getSourceNode: sourceNode,
+      report: async (objects) => Boolean(this.link?.send("drift", { objects })),
+      appliedSettings: this.proxyCatalog?.applied_settings || {},
+      restoreSettings: async (settings) => {
+        const report = createApplyReport("settings-restore");
+        await applyDeviceSettings(this.client, settings, report);
+        for (const warning of report.warnings) log.warn(warning);
+      }
+    });
+    this.link = new LinkClient({
+      getTarget: () => ({ url: this.config?.pairing?.master_agent_url, token: this.config?.pairing?.master_command_token }),
+      hello: () => ({
+        node_id: this.config?.node_id,
+        version: APP_VERSION,
+        applied_content_hash: this.proxyCatalog?.applied_content_hash || null,
+        applied_change_hash: this.proxyCatalog?.applied_change_hash || null,
+        hardware: this.hardwareProfile
+      }),
+      onFull: async (message) => {
+        this.applyProxyStates(message.states || [], { full: true });
+        for (const update of message.activities || []) await this.activitySync.apply(update);
+      },
+      onEvent: async (message) => {
+        if (message.type === "state") this.applyProxyStates(message.states || []);
+        else if (message.type === "activity" && message.update) await this.activitySync.apply(message.update);
+      },
+      onStatus: (status) => {
+        this.status.link = status;
+        if (status.connected) this.driftGuard?.flush().catch(() => {});
+        this.#notify();
+      }
+    });
+    this.link.start();
+    // Satellites also watch their own Core: edits to configuration that came from the Primary are reverted.
+    if (!this.watcher) {
+      this.watcher = new CoreEventWatcher(this.config.remote, async () => {}, {
+        configurationFilter: () => true,
+        configurationDetailCallback: (name, data) => this.driftGuard?.note(name, data)
+      });
+      this.watcherTask = this.watcher.run().catch((error) => log.error("Satellite event watcher stopped:", error));
+    }
+    readHardwareProfile(this.client).then((profile) => { this.hardwareProfile = profile; }).catch(() => {});
+    // Without a link (Primary on an older release), pull states over HTTP once.
+    setTimeout(() => { if (!this.link?.connected) this.#scheduleProxyStateRefresh(0); }, 15_000).unref?.();
   }
 
   applyActivityState(update) {
@@ -343,7 +585,10 @@ export class RemoteSyncService {
           consecutive_failures: result.success ? 0 : Number((this.satelliteManager.runtime.get(peer.peer_id) || {}).consecutive_failures || 0) + 1,
           next_retry_at: result.success ? null : undefined
         });
-        if (!dryRun && result.success) await this.activitySync.initialize(peer, snapshot.manifest.data.activities || []);
+        if (!dryRun && result.success) {
+          await this.activitySync.initialize(peer, snapshot.manifest.data.activities || []);
+          await this.stateRelay.initialize(peer);
+        }
         if (!dryRun && !result.success) this.#schedulePeerRetry(peer.peer_id);
       }
 
@@ -437,6 +682,7 @@ export class RemoteSyncService {
     if (!this.config || !this.client) return finishReport(Object.assign(createApplyReport(manifest.operation_id), { errors: ["Remote Sync is not configured"] }), false);
     if (this.applying) return finishReport(Object.assign(createApplyReport(manifest.operation_id), { errors: ["A snapshot is already being applied"] }), false);
     this.applying = true;
+    this.driftGuard?.beginApply();
     this.status.state = "building proxy catalog";
     this.#notify();
     try {
@@ -455,7 +701,11 @@ export class RemoteSyncService {
         this.virtualDockServer?.setDocks(manifest.source_node_id, manifest.data.docks || []);
       }
       const previousProxyCatalog = this.proxyCatalog;
-      const nextProxyCatalog = buildProxyCatalog(manifest, previousProxyCatalog);
+      // Adapt the Primary's button mappings and UI pages to this remote's hardware (Remote Two ↔ Remote 3).
+      if (!this.hardwareProfile) this.hardwareProfile = await readHardwareProfile(this.client).catch(() => null);
+      const hardware = new HardwareAdapter(manifest.source_hardware || null, this.hardwareProfile);
+      if (hardware.differs) log.info(`Adapting configuration from ${manifest.source_hardware?.model || "the Primary"} to ${this.hardwareProfile?.model || "this remote"}`);
+      const nextProxyCatalog = buildProxyCatalog(manifest, previousProxyCatalog, { adaptRemoteOptions: (options, context) => hardware.remoteOptions(options, context) });
       const activationChanged = previousProxyCatalog?.activation_hash !== nextProxyCatalog.activation_hash;
       this.proxyCatalog = nextProxyCatalog;
       this.proxyStore.save(this.proxyCatalog);
@@ -468,15 +718,29 @@ export class RemoteSyncService {
 
       this.status.state = "applying proxy configuration";
       this.#notify();
-      const report = await new SnapshotApplier(this.client, this.config, this.operationCache, this.mappings).apply(manifest, resources, this.proxyCatalog, previousProxyCatalog);
+      const applier = new SnapshotApplier(this.client, this.config, this.operationCache, this.mappings, { hardware });
+      const report = await applier.apply(manifest, resources, this.proxyCatalog, previousProxyCatalog);
       this.status.last_sync_at = report.finished_at;
-      if (report.success) this.status.last_snapshot_hash = manifest.content_hash;
+      if (report.success) {
+        this.status.last_snapshot_hash = manifest.content_hash;
+        // Only a fully applied snapshot counts; the link reports this hash so the Primary can tell what is missing.
+        this.proxyCatalog.applied_content_hash = manifest.content_hash;
+        this.proxyCatalog.applied_change_hash = manifest.change_hash || null;
+        // Device settings now held for the Primary; edits to them on this remote are restored.
+        if (!manifest.sections.includes("settings")) this.proxyCatalog.applied_settings = {};
+        else if (applier.appliedSettings) this.proxyCatalog.applied_settings = applier.appliedSettings;
+        this.driftGuard?.setAppliedSettings(this.proxyCatalog.applied_settings || {});
+        this.proxyStore.save(this.proxyCatalog);
+        // Proxy entities were rebuilt from snapshot attributes; take the current live states again.
+        this.link?.requestResync();
+      }
+      this.status.last_hardware_adjustments = report.hardware_adjustments || [];
       this.status.last_sync_result = report.success ? `Applied snapshot from ${manifest.source_name}` : report.errors.join("; ") || "Snapshot apply failed";
       this.status.state = report.success ? "connected" : "error";
       if (report.success) this.status.successful_syncs += 1; else this.status.failed_syncs += 1;
       this.#notify();
       return report;
-    } finally { this.applying = false; }
+    } finally { this.applying = false; this.driftGuard?.endApply(); }
   }
 
   previewReceived(manifest, _resources, _masterContext = {}) {
@@ -542,6 +806,7 @@ export class RemoteSyncService {
       master_broadcasts: []
     };
     this.store.save(this.config);
+    this.#stopSatelliteLink();
     this.status.state = "ready to pair";
     this.status.last_sync_result = "Satellite was unpaired";
     this.#notify();
@@ -564,6 +829,7 @@ export class RemoteSyncService {
     this.store.save(this.config);
     this.status.state = "paired";
     this.status.last_sync_result = `Paired with primary ${pairing.paired_master_name}`;
+    if (!this.link && this.client) this.#startSatelliteLink();
     this.#notify();
     return pairing;
   }
@@ -621,20 +887,47 @@ export class RemoteSyncService {
   // Proxy command routing
   // -------------------------------------------------------------------------
 
-  async executeProxyCommand({ source_entity_id, cmd_id, params }) {
+  async executeProxyCommand({ source_entity_id, cmd_id, params, entity_type = null, issued_at = null, via = null }) {
     if (!this.config || this.config.role !== "master" || !this.client) return { success: false, status: 409, error: "This node is not an active primary" };
+    // Newest action wins: an activity start/stop that was issued before the activity last changed on the Primary (for
+    // example queued while the Primary was asleep) is dropped, and the Satellite is told the current state instead.
+    const activityAction = /^activity\.(on|off)$/.exec(String(cmd_id || ""));
+    const issuedAt = Number(issued_at);
+    if (activityAction && Number.isFinite(issuedAt) && issuedAt > 0) {
+      const lastChange = this.activitySync.lastChange(source_entity_id);
+      if (lastChange && issuedAt < lastChange) {
+        log.info(`Ignoring activity.${activityAction[1]} for ${source_entity_id}${via ? ` from ${via}` : ""}: a newer change happened on the Primary`);
+        const update = this.activitySync.republish(source_entity_id);
+        return { success: true, status: 200, superseded: true, source_entity_id, cmd_id, current_state: update?.state || null };
+      }
+    }
+    const candidates = proxyCommandCandidates(cmd_id, entity_type);
+    let executed = candidates[0];
     try {
-      const readiness = await this.#activityReadiness(source_entity_id, cmd_id);
-      const response = await this.client.executeEntityCommand(source_entity_id, cmd_id, params);
+      const readiness = await this.#activityReadiness(source_entity_id, executed);
+      let response;
+      for (let index = 0; index < candidates.length; index += 1) {
+        executed = candidates[index];
+        try {
+          response = await this.client.executeEntityCommand(source_entity_id, executed, params);
+          break;
+        } catch (error) {
+          // A Core that rejects one spelling of the command id gets the other one; any other error is final.
+          const retry = index + 1 < candidates.length && error instanceof CoreApiError && [400, 422].includes(error.status);
+          if (!retry) throw error;
+          log.debug(`Core rejected command ${executed} for ${source_entity_id}; trying ${candidates[index + 1]}`);
+        }
+      }
       let entity = null;
       try {
         await sleep(100);
         entity = await this.client.getJson(`/entities/${encodeURIComponent(source_entity_id)}`, { optionalStatuses: [404] });
       } catch (error) { log.debug(`Could not refresh state after proxy command: ${error.message}`); }
-      return { success: true, status: 200, source_entity_id, cmd_id, response, entity, readiness };
+      if (entity?.attributes) this.stateRelay.observe(source_entity_id, entity.attributes);
+      return { success: true, status: 200, source_entity_id, cmd_id: executed, response, entity, readiness };
     } catch (error) {
-      log.warn(`Proxy command failed for ${source_entity_id}:${cmd_id}:`, error.message);
-      return { success: false, status: error.status || 502, error: error.message, source_entity_id, cmd_id };
+      log.warn(`Proxy command failed for ${source_entity_id}:${executed}:`, error.message);
+      return { success: false, status: error.status || 502, error: error.message, source_entity_id, cmd_id: executed };
     }
   }
 
@@ -656,14 +949,15 @@ export class RemoteSyncService {
     return summary;
   }
 
-  async #postProxyCommand(url, token, sourceEntityId, cmdId, params) {
+  async #postProxyCommand(url, token, sourceEntityId, cmdId, params, entityType = null, issuedAt = null) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 15_000);
     try {
       const response = await fetch(`${String(url).replace(/\/$/, "")}/v1/proxy/command`, {
         method: "POST",
         headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ source_entity_id: sourceEntityId, cmd_id: cmdId, params }),
+        // The age (not a timestamp) of the action: the two remotes' clocks never have to agree.
+        body: JSON.stringify({ source_entity_id: sourceEntityId, cmd_id: cmdId, params, entity_type: entityType || undefined, issued_age_ms: issuedAt ? Math.max(0, Date.now() - issuedAt) : undefined }),
         signal: controller.signal
       });
       const text = await response.text();
@@ -673,15 +967,32 @@ export class RemoteSyncService {
     } finally { clearTimeout(timer); }
   }
 
-  async forwardProxyCommand(sourceEntityId, cmdId, params = undefined) {
+  async forwardProxyCommand(sourceEntityId, cmdId, params = undefined, { entityType = null, issuedAt = null } = {}) {
     if (!this.config || this.config.role !== "child") return { success: false, status: 409, error: "Proxy commands are only available on satellite remotes" };
     const pairing = this.config.pairing || {};
     if (!pairing.master_agent_url || !pairing.master_command_token) return { success: false, status: 503, error: "Primary command endpoint is not configured; run a synchronization from the primary" };
+    const stampedAt = issuedAt || Date.now();
+    // The persistent link is the fast path. If it is down the command goes over HTTP, which also wakes a sleeping
+    // Primary. A command that was sent over the link but not answered is not repeated, so it never runs twice.
+    if (this.link?.connected) {
+      try {
+        const result = await this.link.request("command", { source_entity_id: sourceEntityId, cmd_id: cmdId, params, entity_type: entityType || undefined, issued_age_ms: Math.max(0, Date.now() - stampedAt) });
+        if (result.success) this.#updateProxyState(sourceEntityId, result.entity?.attributes);
+        return result;
+      } catch (error) {
+        if (error.code !== "LINK_DOWN") return { success: false, status: 504, error: error.message };
+      }
+    }
+    this.link?.nudge();
     try {
-      const result = await this.#postProxyCommand(pairing.master_agent_url, pairing.master_command_token, sourceEntityId, cmdId, params);
+      const result = await this.#postProxyCommand(pairing.master_agent_url, pairing.master_command_token, sourceEntityId, cmdId, params, entityType, stampedAt);
       if (result.success) this.#updateProxyState(sourceEntityId, result.entity?.attributes);
       return result;
     } catch (error) {
+      // Connection refused: the Primary is awake but Remote Sync is not running there. Waking it cannot help.
+      if ((error?.cause?.code || error?.code) === "ECONNREFUSED") {
+        return { success: false, status: 503, error: `Remote Sync is not running on the Primary (${pairing.master_agent_url} refused the connection). Check that its integration setup was finished and the integration is enabled.` };
+      }
       if (!isTransportError(error) || !pairing.master_mac) return { success: false, status: 503, error: error.message };
       await sendMagicPacket(pairing.master_mac, pairing.master_broadcasts || []);
       let lastError = error;
@@ -690,7 +1001,7 @@ export class RemoteSyncService {
       while (Date.now() < deadline) {
         await sleep(WAKE_RETRY_SCHEDULE_MS[Math.min(index++, WAKE_RETRY_SCHEDULE_MS.length - 1)]);
         try {
-          const result = await this.#postProxyCommand(pairing.master_agent_url, pairing.master_command_token, sourceEntityId, cmdId, params);
+          const result = await this.#postProxyCommand(pairing.master_agent_url, pairing.master_command_token, sourceEntityId, cmdId, params, entityType, stampedAt);
           if (result.success) this.#updateProxyState(sourceEntityId, result.entity?.attributes);
           return result;
         } catch (retryError) { lastError = retryError; if (!isTransportError(retryError)) break; }
@@ -701,12 +1012,87 @@ export class RemoteSyncService {
 
   #updateProxyState(sourceEntityId, attributes) {
     if (!attributes || typeof attributes !== "object") return;
-    const descriptor = this.proxyCatalog?.entities?.find((item) => item.source_entity_id === sourceEntityId);
-    if (!descriptor) return;
-    descriptor.attributes = { ...descriptor.attributes, ...attributes };
-    this.proxyCatalog.updated_at = utcNow();
-    this.proxyStore.save(this.proxyCatalog);
-    this.#notifyProxy();
+    this.applyProxyStates([{ source_entity_id: sourceEntityId, attributes }]);
+  }
+
+  // Satellite: live attributes of proxied entities from the Primary (pushed, pulled or returned by a command).
+  applyProxyStates(states, _options = {}) {
+    if (!this.config || this.config.role !== "child") return { success: false, status: 409, error: "This node is not a satellite" };
+    const bySource = new Map((this.proxyCatalog?.entities || []).map((item) => [String(item.source_entity_id), item]));
+    const changed = [];
+    for (const state of Array.isArray(states) ? states : []) {
+      const descriptor = bySource.get(String(state?.source_entity_id || ""));
+      const attributes = proxyAttributes(state?.attributes);
+      if (!descriptor || !Object.keys(attributes).length) continue;
+      descriptor.attributes = { ...(descriptor.attributes || {}), ...attributes };
+      changed.push({ local_id: descriptor.local_id, attributes });
+    }
+    if (changed.length) {
+      this.proxyCatalog.updated_at = utcNow();
+      for (const listener of this.proxyStateListeners) {
+        try { listener(changed); } catch (error) { log.error("Proxy state listener failed:", error); }
+      }
+      this.#scheduleProxySave();
+    }
+    return { success: true, applied: changed.length };
+  }
+
+  // Persisting the catalog on every state change would wear the Remote's flash storage; states are written at most
+  // every few seconds (and on shutdown) so a restarted driver starts from recent values.
+  #scheduleProxySave() {
+    if (this.proxySaveTimer) return;
+    this.proxySaveTimer = setTimeout(() => this.#flushProxySave(), 5000);
+    this.proxySaveTimer.unref?.();
+  }
+
+  #flushProxySave() {
+    if (!this.proxySaveTimer) return;
+    clearTimeout(this.proxySaveTimer);
+    this.proxySaveTimer = null;
+    try { this.proxyStore.save(this.proxyCatalog); } catch (error) { log.warn("Could not persist proxy states:", error.message); }
+  }
+
+  #scheduleProxyStateRefresh(delayMs = 0) {
+    clearTimeout(this.proxyStateRefreshTimer);
+    this.proxyStateRefreshTimer = setTimeout(() => {
+      this.proxyStateRefreshTimer = null;
+      this.refreshProxyStates().catch((error) => log.debug("Proxy state refresh failed:", error.message));
+    }, delayMs);
+    this.proxyStateRefreshTimer.unref?.();
+  }
+
+  // Satellite: ask the Primary for the current state of every proxied entity (after start-up or standby, when pushed
+  // updates may have been missed). The Primary is not woken for this.
+  async refreshProxyStates() {
+    if (!this.config || this.config.role !== "child" || !this.proxyCatalog?.entities?.length) return { success: false };
+    if (this.link?.connected) return { success: true, via: "link" };
+    const pairing = this.config.pairing || {};
+    if (!pairing.master_agent_url || !pairing.master_command_token) return { success: false };
+    const response = await fetch(`${String(pairing.master_agent_url).replace(/\/$/, "")}/v1/proxy/states`, {
+      headers: { Authorization: `Bearer ${pairing.master_command_token}` },
+      signal: AbortSignal.timeout(15_000)
+    });
+    if ([404, 405].includes(response.status)) { log.info("The Primary does not serve live proxy states yet; update Remote Sync on the Primary"); return { success: false }; }
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const body = await response.json();
+    const result = this.applyProxyStates(body?.states || []);
+    log.info(`Refreshed ${result.applied} proxy entity state(s) from the Primary`);
+    return result;
+  }
+
+  // Primary: proxied source entities before the first snapshot of this run (the snapshot replaces the list).
+  async #loadRelaySources() {
+    if (!this.client || this.config?.role !== "master" || this.stateRelay.sources.size) return;
+    const sections = new Set(this.config.sync.sections || []);
+    const items = await this.client.listPaginated("/entities");
+    const entities = items.filter((item) => {
+      const id = String(item?.entity_id || item?.id || "");
+      const type = String(item?.entity_type || "").toLowerCase();
+      if (!id || id.startsWith("remote_sync.main.") || ["activity", "macro"].includes(type)) return false;
+      return type === "remote" ? sections.has("remotes") : sections.has("entities");
+    });
+    if (this.stateRelay.sources.size) return;
+    this.stateRelay.setSnapshot({ data: { entities: entities.filter((item) => String(item.entity_type).toLowerCase() !== "remote"), remotes: entities.filter((item) => String(item.entity_type).toLowerCase() === "remote").map((item) => ({ source_id: item.entity_id || item.id })) } });
   }
 
   previewSync(peerId = null) {
@@ -724,6 +1110,10 @@ export class RemoteSyncService {
   async reconcile() {
     if (!this.config || !this.client) return { success: false, error: "Remote Sync is not configured" };
     if (this.config.role === "master") return this.syncNow(true);
+    if (this.config.role === "child" && this.config.pairing?.paired_master_id) {
+      this.link?.nudge();
+      setTimeout(() => { if (!this.link?.connected) this.#scheduleProxyStateRefresh(0); }, 10_000).unref?.();
+    }
     try {
       const { ready, bad } = await this.client.ready();
       this.status.state = ready ? "connected" : `degraded: ${JSON.stringify(bad)}`;
@@ -738,6 +1128,20 @@ export class RemoteSyncService {
 
   setRemoteInfo(info) {
     this.remoteInfo = info || null;
+  }
+
+  // Set by the driver: reads the Remote's runtime information over the Integration API.
+  setRuntimeInfoProvider(provider) { this.runtimeInfoProvider = provider; }
+
+  // Whether the Remote has an integration instance for Remote Sync. Without one (setup closed before "Done") the Remote
+  // stops the driver as soon as the setup session ends, and with it the agent the Satellites talk to.
+  async setupFinished() {
+    if (!this.runtimeInfoProvider) return null;
+    try {
+      const runtime = await this.runtimeInfoProvider();
+      if (!runtime || !Array.isArray(runtime.intg_ids)) return null;
+      return runtime.intg_ids.length > 0;
+    } catch { return null; }
   }
 
   // Verify a Core API key presented by a Primary during IP + PIN pairing. The key must be an admin key of this
@@ -974,7 +1378,11 @@ export class RemoteSyncService {
 
   syncSettings() {
     if (!this.config) return null;
-    return { ...structuredClone(this.config.sync), available_sections: [...DEFAULT_SECTIONS] };
+    return {
+      ...structuredClone(this.config.sync),
+      available_sections: [...SUPPORTED_SECTIONS],
+      available_settings_categories: Object.values(SETTINGS_CATEGORIES).map(({ label }, index) => ({ id: Object.keys(SETTINGS_CATEGORIES)[index], label }))
+    };
   }
 
   async updateSyncSettings(patch = {}) {
@@ -983,11 +1391,16 @@ export class RemoteSyncService {
     const sync = next.sync;
     if (patch.sections !== undefined) {
       if (!Array.isArray(patch.sections)) throw new Error("sections must be a list");
-      sync.sections = DEFAULT_SECTIONS.filter((section) => patch.sections.includes(section));
+      sync.sections = SUPPORTED_SECTIONS.filter((section) => patch.sections.includes(section));
       if (!sync.sections.length) throw new Error("Enable at least one synchronization section");
       if (sync.sections.includes("docks") && !next.physical_docks?.default_token && !Object.keys(next.physical_docks?.tokens || {}).length) {
         throw new Error("Dock synchronization needs a physical Dock API token; set it in the integration setup first");
       }
+    }
+    if (patch.settings_categories !== undefined) {
+      if (!Array.isArray(patch.settings_categories)) throw new Error("settings_categories must be a list");
+      sync.settings_categories = normalizeSettingsCategories(patch.settings_categories);
+      if (sync.sections.includes("settings") && !sync.settings_categories.length) throw new Error("Choose at least one kind of device setting, or turn off device settings");
     }
     if (patch.interval_seconds !== undefined) {
       const interval = Number(patch.interval_seconds);
@@ -1107,7 +1520,10 @@ export class RemoteSyncService {
       status: structuredClone(this.status),
       agent_url: this.agentUrl,
       proxy_count: this.proxyCatalog?.entities?.length || 0,
-      satellites: this.config?.role === "master" ? this.satelliteManager.list() : [],
+      satellites: this.config?.role === "master" ? this.satelliteManager.list().map((item) => ({ ...item, link: this.linkHub?.status(item.peer_id) || { connected: false } })) : [],
+      link: this.config?.role === "child" ? (this.link?.status() || { connected: false }) : null,
+      drift: this.config?.role === "child" ? (this.driftGuard?.status() || null) : null,
+      hardware: this.hardwareProfile,
       virtual_docks: this.virtualDockServer?.status() || null,
       dock_tunnels: this.dockTunnelSessions.size,
       version: APP_VERSION,
