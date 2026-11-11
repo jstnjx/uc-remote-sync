@@ -4,7 +4,7 @@ import { SnapshotApplier } from "../apply/index.js";
 import { CoreApiError, CoreClient } from "../core/client.js";
 import { CoreEventWatcher } from "../core/events.js";
 import { MappingStore } from "../storage/mappings.js";
-import { createApplyReport, createStatus, finishReport, redactConfig } from "../shared/models.js";
+import { createApplyReport, createStatus, finishReport, incrementReport, redactConfig } from "../shared/models.js";
 import { OperationCache } from "../storage/operations.js";
 import { buildProxyCatalog, ProxyCatalogStore } from "../proxy/catalog.js";
 import { defaultPairingUrl, generatePairingIdentifier, normalizePairingIdentifier, RemoteSyncDiscovery } from "../pairing/mdns.js";
@@ -305,8 +305,12 @@ export class RemoteSyncService {
     this.periodicTimer = setTimeout(async () => {
       try {
         const peers = await this.satelliteManager.refresh();
-        const stale = peers.filter((peer) => peer.enabled && peer.last_applied_hash !== this.status.last_snapshot_hash);
-        for (const peer of stale) this.#schedulePeerRetry(peer.peer_id, true);
+        // Compared by change hash (content hashes include live device states and always differ), only for Satellites
+        // that are awake and report what they hold. A sleeping Satellite is never woken for this: its link brings it up
+        // to date as soon as it wakes up.
+        const current = this.syncCoordinator.cachedSnapshot()?.manifest?.change_hash || this.status.last_change_hash || null;
+        const stale = peers.filter((peer) => peer.enabled && peer.online && current && peer.last_applied_change_hash && peer.last_applied_change_hash !== current);
+        for (const peer of stale) this.#queuePeerSync(peer.peer_id, "periodic check found an older configuration");
         if (!this.lastFullAuditAt || Date.now() - this.lastFullAuditAt >= FULL_AUDIT_INTERVAL_MS) {
           this.lastFullAuditAt = Date.now(); await this.syncNow(false, { reconcile: true, reason: "daily audit" });
         }
@@ -357,10 +361,15 @@ export class RemoteSyncService {
       this.status.telemetry.retries += 1;
       const snapshot = this.syncCoordinator.cachedSnapshot();
       if (!snapshot) { this.status.pending_changes = true; this.#scheduleEventSync(); return; }
-      const result = await this.syncCoordinator.pushSnapshot(peer, snapshot.payload);
+      const result = await this.syncCoordinator.pushSnapshot(peer, snapshot.payload, { wake: false });
+      if (result.asleep) { this.#recordAsleep(peerId); return; }
       if (result.success) { this.stateRelay.initialize(peer).catch(() => {}); this.satelliteManager.record(peerId, { online: true, last_error: null, last_applied_hash: snapshot.manifest.content_hash, last_attempted_hash: snapshot.manifest.content_hash, consecutive_failures: 0, next_retry_at: null, last_seen_at: utcNow() }); }
       else { const nextFailures = failures + 1; this.satelliteManager.record(peerId, { online: false, last_error: result.error || result.report?.error || "Synchronization failed", last_attempted_hash: snapshot.manifest.content_hash, consecutive_failures: nextFailures }); this.#schedulePeerRetry(peerId); }
     }, delay); timer.unref?.(); this.retryTimers.set(peerId, timer);
+  }
+
+  #recordAsleep(peerId) {
+    this.satelliteManager.record(peerId, { online: false, last_error: null, next_retry_at: null, last_sync_result: "In standby; takes the configuration when it wakes up" });
   }
 
   #automaticLoadAllowed() {
@@ -488,7 +497,8 @@ export class RemoteSyncService {
       try {
         const cached = this.syncCoordinator.cachedSnapshot();
         const snapshot = !fresh && cached ? cached : await this.syncCoordinator.buildSnapshot({ force: true });
-        const result = await this.syncCoordinator.pushSnapshot(peer, snapshot.payload);
+        const result = await this.syncCoordinator.pushSnapshot(peer, snapshot.payload, { wake: false, full: fresh });
+        if (result.asleep) { this.#recordAsleep(peerId); return; }
         if (result.success) {
           await this.activitySync.initialize(peer, snapshot.manifest.data.activities || []);
           await this.stateRelay.initialize(peer);
@@ -623,8 +633,14 @@ export class RemoteSyncService {
       for (const peer of peers) {
         const result = dryRun
           ? await this.syncCoordinator.previewPeer(peer, snapshot.payload)
-          : await this.syncCoordinator.pushSnapshot(peer, snapshot.payload);
+          : await this.syncCoordinator.pushSnapshot(peer, snapshot.payload, { wake: force, full: force });
         peerResults[peer.peer_id] = result;
+        if (result.asleep) {
+          // Not a failure: the Satellite is in standby and takes this configuration over its link when it wakes up.
+          peerResults[peer.peer_id] = { ...result, success: true, deferred: true };
+          this.#recordAsleep(peer.peer_id);
+          continue;
+        }
         success &&= Boolean(result.success);
         this.satelliteManager.record(peer.peer_id, {
           online: Boolean(result.success),
@@ -754,6 +770,23 @@ export class RemoteSyncService {
       }
       if (this.config.role === "child" && manifest.sections.includes("docks")) {
         this.virtualDockServer?.setDocks(manifest.source_node_id, manifest.data.docks || []);
+      }
+      // An automatic synchronization of the configuration this Satellite already holds changes nothing: rewriting every
+      // activity and page anyway makes the remote reload its UI and is what made Satellites sluggish. The drift guard
+      // confirms nothing was edited here before the apply is skipped.
+      if (masterContext.apply_mode === "changes" && manifest.change_hash && this.proxyCatalog?.applied_change_hash === manifest.change_hash
+        && this.driftGuard && await this.driftGuard.intact()) {
+        this.proxyCatalog.applied_content_hash = manifest.content_hash;
+        this.proxyStore.save(this.proxyCatalog);
+        this.status.last_snapshot_hash = manifest.content_hash;
+        this.status.last_sync_result = `Configuration from ${manifest.source_name} is already applied`;
+        this.status.state = "connected";
+        this.link?.requestResync();
+        log.info(`Configuration ${manifest.change_hash.slice(0, 12)} is already applied; nothing to do`);
+        const report = createApplyReport(manifest.operation_id);
+        report.unchanged = true;
+        incrementReport(report, "unchanged_snapshots");
+        return finishReport(report, true);
       }
       const previousProxyCatalog = this.proxyCatalog;
       // Adapt the Primary's button mappings and UI pages to this remote's hardware (Remote Two ↔ Remote 3).
@@ -1582,6 +1615,7 @@ export class RemoteSyncService {
       status: structuredClone(this.status),
       agent_url: this.agentUrl,
       proxy_count: this.proxyCatalog?.entities?.length || 0,
+      applied_change_hash: this.config?.role === "child" ? (this.proxyCatalog?.applied_change_hash || null) : null,
       satellites: this.config?.role === "master" ? this.satelliteManager.list().map((item) => ({ ...item, link: this.linkHub?.status(item.peer_id) || { connected: false } })) : [],
       link: this.config?.role === "child" ? (this.link?.status() || { connected: false }) : null,
       drift: this.config?.role === "child" ? (this.driftGuard?.status() || null) : null,

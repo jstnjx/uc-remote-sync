@@ -196,6 +196,20 @@ export class DriftGuard {
     return Object.fromEntries(next);
   }
 
+  // True when every synchronized object still looks exactly as Remote Sync left it (and nothing is waiting to be
+  // restored). An automatic synchronization of an unchanged configuration is then skipped entirely.
+  async intact() {
+    if (!this.fingerprints.size || this.pending.size || this.unsent.length || this.pendingSettings) return false;
+    for (const [key, expected] of this.fingerprints) {
+      const [kind, id] = key.split("|");
+      let actual;
+      try { actual = await this.#fingerprint(kind, id); } catch { return false; }
+      this.verified += 1;
+      if (actual !== expected) return false;
+    }
+    return true;
+  }
+
   restoreFingerprints(value) {
     this.fingerprints = new Map(Object.entries(value && typeof value === "object" ? value : {}));
   }

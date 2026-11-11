@@ -24,22 +24,26 @@ export const SETTINGS_CATEGORIES = Object.freeze({
   },
   display: {
     key: "display", path: "/cfg/display", label: "Display brightness",
-    fields: { brightness: int(0, 100), auto_brightness: bool }
+    fields: { brightness: int(0, 100), auto_brightness: bool },
+    required: ["brightness", "auto_brightness"]
   },
-  haptic: { key: "haptic", path: "/cfg/haptic", label: "Haptic feedback", fields: { enabled: bool } },
-  sound: { key: "sound", path: "/cfg/sound", label: "Sound effects", fields: { enabled: bool, volume: int(0, 100) } },
+  haptic: { key: "haptic", path: "/cfg/haptic", label: "Haptic feedback", fields: { enabled: bool }, required: ["enabled"] },
+  sound: { key: "sound", path: "/cfg/sound", label: "Sound effects", fields: { enabled: bool, volume: int(0, 100) }, required: ["enabled", "volume"] },
   power_saving: {
     key: "power_saving", path: "/cfg/power_saving", label: "Power saving and standby",
-    fields: { wakeup_sensitivity: int(0, 3), display_off_sec: int(0, 60), standby_sec: int(0, 10_800) }
+    fields: { wakeup_sensitivity: int(0, 3), display_off_sec: int(0, 60), standby_sec: int(0, 10_800) },
+    required: ["wakeup_sensitivity", "display_off_sec", "standby_sec"]
   },
   localization: {
     key: "localization", path: "/cfg/localization", label: "Language, region and time",
-    fields: { language_code: string, country_code: string, time_zone: string, time_format_24h: bool, measurement_unit: oneOf("METRIC", "US", "UK") }
+    fields: { language_code: string, country_code: string, time_zone: string, time_format_24h: bool, measurement_unit: oneOf("METRIC", "US", "UK") },
+    required: ["language_code", "country_code", "time_zone", "time_format_24h", "measurement_unit"]
   },
   voice: { key: "voice", path: "/cfg/voice_control", label: "Microphone", fields: { microphone: bool } },
   software_update: {
     key: "software_update", path: "/cfg/software_update", label: "Software update schedule",
-    fields: { check_for_updates: bool, auto_update: bool, ota_window_start: timeOfDay, ota_window_end: timeOfDay }
+    fields: { check_for_updates: bool, auto_update: bool, ota_window_start: timeOfDay, ota_window_end: timeOfDay },
+    required: ["check_for_updates", "auto_update"]
   }
 });
 

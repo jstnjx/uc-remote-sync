@@ -525,7 +525,9 @@ export class AgentServer {
           master_agent_url: request.headers["x-remote-sync-master-url"] || null,
           master_command_token: request.headers["x-remote-sync-command-token"] || null,
           master_mac: request.headers["x-remote-sync-master-mac"] || null,
-          master_broadcasts: String(request.headers["x-remote-sync-master-broadcasts"] || "").split(",").map((item) => item.trim()).filter(Boolean)
+          master_broadcasts: String(request.headers["x-remote-sync-master-broadcasts"] || "").split(",").map((item) => item.trim()).filter(Boolean),
+          // "full" (manual synchronization, restoring local edits) or "changes" (automatic); older Primaries send nothing.
+          apply_mode: String(request.headers["x-remote-sync-apply"] || "full").toLowerCase() === "changes" ? "changes" : "full"
         };
         if (url.pathname.endsWith("/preview")) {
           if (!this.previewCallback) {

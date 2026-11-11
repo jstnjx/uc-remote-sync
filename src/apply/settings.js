@@ -53,7 +53,7 @@ export async function applyDeviceSettings(client, settings, report, { categories
       }
       if (!sameSettingValue(current[field], value)) payload[field] = value;
     }
-    const written = await patchCategory(client, category, payload, report);
+    const written = await patchCategory(client, category, payload, report, current);
     applied[id] = extractSettings({ [category.key]: { ...current, ...written } }, [id])[id] || {};
     if (Object.keys(written).length) incrementReport(report, "settings_updated");
     else incrementReport(report, "settings_unchanged");
@@ -61,10 +61,18 @@ export async function applyDeviceSettings(client, settings, report, { categories
   return applied;
 }
 
-async function patchCategory(client, category, payload, report) {
+// The Core replaces most categories as a whole (PATCH /cfg/sound without `enabled` is rejected with "missing field"),
+// so every write carries the category's required fields, taken from this remote's current values.
+function fullBody(category, current, changes) {
+  const body = {};
+  for (const field of category.required || []) if (current?.[field] !== undefined) body[field] = current[field];
+  return { ...body, ...changes };
+}
+
+async function patchCategory(client, category, payload, report, current = {}) {
   if (!Object.keys(payload).length) return {};
   try {
-    await client.json("PATCH", category.path, { json: payload, expected: [200] });
+    await client.json("PATCH", category.path, { json: fullBody(category, current, payload), expected: [200] });
     log.info(`Applied ${category.label}: ${Object.keys(payload).join(", ")}`);
     return payload;
   } catch (error) {
@@ -77,7 +85,7 @@ async function patchCategory(client, category, payload, report) {
   const written = {};
   for (const [field, value] of Object.entries(payload)) {
     try {
-      await client.json("PATCH", category.path, { json: { [field]: value }, expected: [200] });
+      await client.json("PATCH", category.path, { json: fullBody(category, { ...current, ...written }, { [field]: value }), expected: [200] });
       written[field] = value;
     } catch (error) {
       report.warnings.push(`Could not apply ${category.label} → ${field}: ${error.message}`);

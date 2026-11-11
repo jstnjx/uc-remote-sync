@@ -25,7 +25,7 @@ function runtimeDefaults() {
     dock_tunnels: 0,
     last_sync_at: null,
     last_sync_result: null,
-    last_applied_hash: null, last_attempted_hash: null, consecutive_failures: 0, next_retry_at: null
+    last_applied_hash: null, last_applied_change_hash: null, last_attempted_hash: null, consecutive_failures: 0, next_retry_at: null
   };
 }
 
@@ -100,7 +100,8 @@ export class SatelliteManager {
           last_sync_at: status?.status?.last_sync_at || null,
           last_sync_result: status?.status?.last_sync_result || null,
           url: destination.url,
-          last_applied_hash: status?.status?.last_snapshot_hash || null
+          last_applied_hash: status?.status?.last_snapshot_hash || null,
+          last_applied_change_hash: status?.applied_change_hash || null
         });
       } catch (error) {
         this.record(peer.peer_id, { online: false, last_error: error.message });

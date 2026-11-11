@@ -92,7 +92,7 @@ test("only differing values are written, per category, and the result is what th
   const applied = await applyDeviceSettings(core, wanted, report);
   assert.deepEqual(core.patches, [
     { method: "PATCH", path: "/cfg/button", json: { brightness: 80, static_color: { rgb: [0, 0, 255] } } },
-    { method: "PATCH", path: "/cfg/sound", json: { enabled: true } }
+    { method: "PATCH", path: "/cfg/sound", json: { enabled: true, volume: 30 } }
   ]);
   assert.deepEqual(applied.sound, { enabled: true, volume: 30 });
   assert.equal(report.counts.settings_updated, 2);
@@ -116,7 +116,7 @@ test("a category or field the target remote does not have is skipped and reporte
   const core = fakeCore(target);
   const adjustments = [];
   await applyDeviceSettings(core, { haptic: { enabled: false }, power_saving: { wakeup_sensitivity: 1, display_off_sec: 30 } }, createApplyReport("op"), { adjustments });
-  assert.deepEqual(core.patches, [{ method: "PATCH", path: "/cfg/power_saving", json: { display_off_sec: 30 } }]);
+  assert.deepEqual(core.patches, [{ method: "PATCH", path: "/cfg/power_saving", json: { display_off_sec: 30, standby_sec: 60 } }]);
   assert.ok(adjustments.some((item) => /Haptic feedback is not available/.test(item)));
   assert.ok(adjustments.some((item) => /wakeup_sensitivity is not available/.test(item)));
 });
@@ -126,7 +126,7 @@ test("a rejected category is retried field by field and never fails the synchron
   const core = fakeCore(target);
   const original = core.json;
   core.json = async (method, p, options) => {
-    if (p === "/cfg/power_saving" && "standby_sec" in options.json) throw new CoreApiError(400, method, p, { code: "BAD_REQUEST" });
+    if (p === "/cfg/power_saving" && options.json.standby_sec === 900) throw new CoreApiError(400, method, p, { code: "BAD_REQUEST" });
     return original(method, p, options);
   };
   const report = createApplyReport("op");
@@ -134,6 +134,23 @@ test("a rejected category is retried field by field and never fails the synchron
   assert.deepEqual(applied.power_saving, { wakeup_sensitivity: 3, display_off_sec: 5, standby_sec: 180 });
   assert.equal(report.errors.length, 0);
   assert.ok(report.warnings.some((item) => /standby_sec/.test(item)));
+});
+
+test("every write carries the category's required fields, as the Core demands (missing field `wakeup_sensitivity`)", async () => {
+  const target = cfgAll();
+  const core = fakeCore(target);
+  const original = core.json;
+  const required = { "/cfg/power_saving": ["wakeup_sensitivity", "display_off_sec", "standby_sec"], "/cfg/sound": ["enabled", "volume"], "/cfg/display": ["brightness", "auto_brightness"] };
+  core.json = async (method, p, options) => {
+    for (const field of required[p] || []) if (!(field in options.json)) throw new CoreApiError(400, method, p, { code: "INVALID_JSON", message: `missing field \`${field}\`` });
+    return original(method, p, options);
+  };
+  const report = createApplyReport("op");
+  const applied = await applyDeviceSettings(core, { power_saving: { standby_sec: 600 }, sound: { enabled: true }, display: { brightness: 50 } }, report);
+  assert.deepEqual(report.warnings, []);
+  assert.deepEqual(core.patches.find((item) => item.path === "/cfg/power_saving").json, { wakeup_sensitivity: 2, display_off_sec: 20, standby_sec: 600 });
+  assert.deepEqual(applied.sound, { enabled: true, volume: 30 });
+  assert.equal(report.counts.settings_updated, 3);
 });
 
 test("a remote that cannot report its settings is left alone", async () => {

@@ -57,7 +57,7 @@ export class SyncCoordinator {
     if (!force && (snapshot.manifest.content_hash === status.last_snapshot_hash || (snapshot.manifest.change_hash && snapshot.manifest.change_hash === status.last_change_hash))) {
       return { success: true, changed: false };
     }
-    const result = await this.pushSnapshot(peer, snapshot.payload);
+    const result = await this.pushSnapshot(peer, snapshot.payload, { full: force });
     if (result.success) await this.initializeActivityStates(peer, snapshot.manifest.data.activities || []);
     return result;
   }
@@ -76,7 +76,7 @@ export class SyncCoordinator {
     throw Object.assign(new Error(`Satellite ${peer.name} has no pairing identifier or URL`), { code: "ENOTFOUND" });
   }
 
-  async postSnapshot(peer, payload, { forceDiscovery = false } = {}) {
+  async postSnapshot(peer, payload, { forceDiscovery = false, full = false } = {}) {
     const config = this.getConfig();
     const destination = await this.resolvePeerUrl(peer, forceDiscovery);
     const client = new PeerAgentClient(destination.url, peer.token, { timeoutMs: 180_000 });
@@ -87,7 +87,8 @@ export class SyncCoordinator {
         "X-Remote-Sync-Master-Url": reachableAgentUrl(config) || "",
         "X-Remote-Sync-Command-Token": peer.command_token || "",
         "X-Remote-Sync-Master-Mac": config.remote?.mac || "",
-        "X-Remote-Sync-Master-Broadcasts": (config.remote?.broadcasts || []).join(",")
+        "X-Remote-Sync-Master-Broadcasts": (config.remote?.broadcasts || []).join(","),
+        "X-Remote-Sync-Apply": full ? "full" : "changes"
       }
     });
     const restartRequired = body.status === 202 && body.restart_required === true;
@@ -157,13 +158,17 @@ export class SyncCoordinator {
     };
   }
 
-  async pushSnapshot(peer, payload) {
+  // wake = false: an automatic synchronization never wakes a sleeping Satellite. It catches up by itself when it wakes
+  // up and its link reconnects (waking it every hour for nothing is what drained it and made it sluggish).
+  // full = true: the Satellite re-applies everything even if it already holds this configuration.
+  async pushSnapshot(peer, payload, { wake = true, full = false } = {}) {
     try {
-      const result = await this.postSnapshot(peer, payload);
+      const result = await this.postSnapshot(peer, payload, { full });
       if (result.restart_required) return this.waitForRestartAndResend(peer, payload, result);
       return result;
     } catch (error) {
       if (!isTransportError(error)) return { success: false, error: error.message, wowlan_sent: false };
+      if (!wake) return { success: false, error: error.message, wowlan_sent: false, asleep: true };
       if (peer.identifier) this.discovery.clear(peer.identifier);
 
       let wowlanSent = false;
@@ -172,7 +177,7 @@ export class SyncCoordinator {
         wowlanSent = true;
       } else {
         try {
-          const result = await this.postSnapshot(peer, payload, { forceDiscovery: true });
+          const result = await this.postSnapshot(peer, payload, { forceDiscovery: true, full });
           return result.restart_required
             ? { ...(await this.waitForRestartAndResend(peer, payload, result)), wowlan_sent: false }
             : { ...result, wowlan_sent: false };
@@ -187,7 +192,7 @@ export class SyncCoordinator {
       while (Date.now() < deadline) {
         await sleep(WAKE_RETRY_SCHEDULE_MS[Math.min(index++, WAKE_RETRY_SCHEDULE_MS.length - 1)]);
         try {
-          const result = await this.postSnapshot(peer, payload, { forceDiscovery: true });
+          const result = await this.postSnapshot(peer, payload, { forceDiscovery: true, full });
           const finalResult = result.restart_required ? await this.waitForRestartAndResend(peer, payload, result) : result;
           return { ...finalResult, wowlan_sent: wowlanSent };
         } catch (retryError) {
