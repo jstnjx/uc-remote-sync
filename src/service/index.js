@@ -89,6 +89,7 @@ export class RemoteSyncService {
     this.lastSyncCompletedAt = 0;
     this.trailingSyncRequested = false;
     this.configurationRevision = 0;
+    this.pendingConfigurationEvents = new Set();
     this.syncing = false;
     this.applying = false;
     this.listeners = [];
@@ -323,6 +324,7 @@ export class RemoteSyncService {
   async #configurationEvents(events) {
     if (!this.config || this.config.role !== "master" || !this.config.sync.auto_sync) return;
     log.debug("Configuration event batch:", [...events].sort());
+    for (const event of events) this.pendingConfigurationEvents.add(String(event));
     this.configurationRevision += 1;
     this.syncCoordinator.invalidateCache();
     this.status.pending_changes = true;
@@ -492,11 +494,12 @@ export class RemoteSyncService {
         return;
       }
       this.peerSyncAt.set(peerId, Date.now());
-      log.info(`Synchronizing ${peer.name || peerId}: ${reason}`);
+      log.info(`Synchronizing ${peer.name || peerId}: reason=${reason} mode=${fresh ? "full" : "changes"}`);
       this.syncing = true;
       try {
         const cached = this.syncCoordinator.cachedSnapshot();
         const snapshot = !fresh && cached ? cached : await this.syncCoordinator.buildSnapshot({ force: true });
+        log.info(`Peer sync hashes for ${peer.name || peerId}: previous=${String(this.satelliteManager.runtime.get(peerId)?.last_applied_change_hash || "none").slice(0, 12)} next=${String(snapshot.manifest.change_hash || "none").slice(0, 12)} content=${String(snapshot.manifest.content_hash || "none").slice(0, 12)}`);
         const result = await this.syncCoordinator.pushSnapshot(peer, snapshot.payload, { wake: false, full: fresh });
         if (result.asleep) { this.#recordAsleep(peerId); return; }
         if (result.success) {
@@ -615,12 +618,15 @@ export class RemoteSyncService {
     this.status.last_sync_result = dryRun ? "Collecting primary configuration for preview" : "Collecting primary configuration";
     this.#notify();
     try {
-      this.status.telemetry.last_build_reason = reason || (dryRun ? "preview" : force ? "forced" : reconcile ? "audit" : "configuration event");
+      const eventReasons = [...this.pendingConfigurationEvents].sort().slice(0, 12);
+      this.status.telemetry.last_build_reason = reason || (dryRun ? "preview" : force ? "forced" : reconcile ? "audit" : `configuration event (${eventReasons.join(", ") || "unspecified"})`);
       const snapshot = await this.syncCoordinator.buildSnapshot({ force: force || reconcile || dryRun, shouldAbort: () => !force && !dryRun && this.configurationRevision !== syncRevision });
       this.status.telemetry.builds += 1; Object.assign(this.status.telemetry, { last_build_ms: snapshot.metrics?.build_ms || null, last_compression_ms: snapshot.metrics?.compression_ms || null, last_payload_bytes: snapshot.metrics?.payload_bytes || snapshot.payload.length, last_uncompressed_bytes: snapshot.metrics?.uncompressed_bytes || null, last_resource_count: snapshot.metrics?.resource_count || 0 });
+      log.info(`Snapshot decision: reason=${this.status.telemetry.last_build_reason} requested_mode=${force ? "full" : "changes"} previous_change=${String(this.status.last_change_hash || "none").slice(0, 12)} new_change=${String(snapshot.manifest.change_hash || "none").slice(0, 12)} previous_content=${String(this.status.last_snapshot_hash || "none").slice(0, 12)} new_content=${String(snapshot.manifest.content_hash || "none").slice(0, 12)}`);
       const unchanged = snapshot.manifest.content_hash === this.status.last_snapshot_hash
         || (snapshot.manifest.change_hash && snapshot.manifest.change_hash === this.status.last_change_hash);
       if (!dryRun && !force && unchanged) {
+        if (this.configurationRevision === syncRevision) this.pendingConfigurationEvents.clear();
         Object.assign(this.status, { pending_changes: this.configurationRevision !== syncRevision, state: "connected", last_sync_result: "No configuration changes" });
         this.#notify();
         return { success: true, changed: false, content_hash: snapshot.manifest.content_hash };
@@ -631,6 +637,7 @@ export class RemoteSyncService {
       const peerResults = {};
       let success = true;
       for (const peer of peers) {
+        if (!dryRun) log.info(`Pushing snapshot to ${peer.name || peer.peer_id}: reason=${this.status.telemetry.last_build_reason} mode=${force ? "full" : "changes"} previous_applied=${String(this.satelliteManager.runtime.get(peer.peer_id)?.last_applied_change_hash || "none").slice(0, 12)} change=${String(snapshot.manifest.change_hash || "none").slice(0, 12)}`);
         const result = dryRun
           ? await this.syncCoordinator.previewPeer(peer, snapshot.payload)
           : await this.syncCoordinator.pushSnapshot(peer, snapshot.payload, { wake: force, full: force });
@@ -652,6 +659,8 @@ export class RemoteSyncService {
           last_sync_result: dryRun ? result.preview?.summary || null : (result.success ? "Synchronized" : result.error || "Synchronization failed"),
           mirrored_entities: Number(result.report?.counts?.proxy_entities_configured || result.report?.counts?.proxy_entities_updated || 0),
           last_attempted_hash: snapshot.manifest.content_hash,
+          last_attempted_change_hash: snapshot.manifest.change_hash || null,
+          last_applied_change_hash: result.success ? snapshot.manifest.change_hash || null : undefined,
           last_applied_hash: result.success ? snapshot.manifest.content_hash : undefined,
           consecutive_failures: result.success ? 0 : Number((this.satelliteManager.runtime.get(peer.peer_id) || {}).consecutive_failures || 0) + 1,
           next_retry_at: result.success ? null : undefined
@@ -714,6 +723,7 @@ export class RemoteSyncService {
         }).join(" | ").slice(0, 1000) || `${failed.length} satellite remote(s) failed`;
       }
       if (success) {
+        if (this.configurationRevision === syncRevision) this.pendingConfigurationEvents.clear();
         this.status.last_snapshot_hash = snapshot.manifest.content_hash;
         this.status.last_change_hash = snapshot.manifest.change_hash || null;
         this.status.pending_changes = this.configurationRevision !== syncRevision;
@@ -774,8 +784,14 @@ export class RemoteSyncService {
       // An automatic synchronization of the configuration this Satellite already holds changes nothing: rewriting every
       // activity and page anyway makes the remote reload its UI and is what made Satellites sluggish. The drift guard
       // confirms nothing was edited here before the apply is skipped.
-      if (masterContext.apply_mode === "changes" && manifest.change_hash && this.proxyCatalog?.applied_change_hash === manifest.change_hash
-        && this.driftGuard && await this.driftGuard.intact()) {
+      const sameConfiguration = Boolean(manifest.change_hash && this.proxyCatalog?.applied_change_hash === manifest.change_hash);
+      const integrity = masterContext.apply_mode === "changes" && sameConfiguration && this.driftGuard
+        ? (typeof this.driftGuard.integrityReport === "function"
+          ? await this.driftGuard.integrityReport()
+          : { intact: await this.driftGuard.intact(), reason: "legacy integrity check" })
+        : null;
+      log.info(`Satellite received snapshot: mode=${masterContext.apply_mode || "unknown"} change=${String(manifest.change_hash || "none").slice(0, 12)} previous=${String(this.proxyCatalog?.applied_change_hash || "none").slice(0, 12)} same_configuration=${sameConfiguration} integrity=${integrity?.intact ?? "not-checked"}${integrity && !integrity.intact ? ` reason=${integrity.reason}${integrity.key ? ` object=${integrity.key}` : ""}` : ""}`);
+      if (integrity?.intact) {
         this.proxyCatalog.applied_content_hash = manifest.content_hash;
         this.proxyStore.save(this.proxyCatalog);
         this.status.last_snapshot_hash = manifest.content_hash;
@@ -795,9 +811,22 @@ export class RemoteSyncService {
       if (hardware.differs) log.info(`Adapting configuration from ${manifest.source_hardware?.model || "the Primary"} to ${this.hardwareProfile?.model || "this remote"}`);
       const nextProxyCatalog = buildProxyCatalog(manifest, previousProxyCatalog, { adaptRemoteOptions: (options, context) => hardware.remoteOptions(options, context) });
       const activationChanged = previousProxyCatalog?.activation_hash !== nextProxyCatalog.activation_hash;
+      // Live states arrive through their own channel. Re-registering 157 proxy
+      // entities for a state-only change creates needless Core UI work.
+      const proxyConfigurationHash = (catalog) => sha256Bytes(canonicalJson(stableConfiguration(
+        (catalog?.entities || []).map(({ attributes: _attributes, ...descriptor }) => descriptor)
+      )));
+      const catalogChanged = proxyConfigurationHash(previousProxyCatalog) !== proxyConfigurationHash(nextProxyCatalog);
+      const sameSource = previousProxyCatalog?.source_node_id === manifest.source_node_id;
+      const appliedObjects = sameSource ? structuredClone(previousProxyCatalog?.applied_objects || {}) : {};
+      for (const key of ["applied_content_hash", "applied_change_hash", "applied_fingerprints", "applied_settings"]) {
+        if (sameSource && previousProxyCatalog?.[key] !== undefined) nextProxyCatalog[key] = previousProxyCatalog[key];
+      }
+      nextProxyCatalog.applied_objects = appliedObjects;
       this.proxyCatalog = nextProxyCatalog;
       this.proxyStore.save(this.proxyCatalog);
-      this.#notifyProxy();
+      if (catalogChanged) this.#notifyProxy();
+      else log.info("Proxy descriptors unchanged; skipped available/configured entity re-registration");
 
       if (activationChanged) {
         log.info(`Proxy catalog changed (${nextProxyCatalog.entities.length} entities); refreshing it through the Core WebSocket API`);
@@ -806,7 +835,7 @@ export class RemoteSyncService {
 
       this.status.state = "applying proxy configuration";
       this.#notify();
-      const applier = new SnapshotApplier(this.client, this.config, this.operationCache, this.mappings, { hardware });
+      const applier = new SnapshotApplier(this.client, this.config, this.operationCache, this.mappings, { hardware, appliedObjects });
       const report = await applier.apply(manifest, resources, this.proxyCatalog, previousProxyCatalog);
       this.status.last_sync_at = report.finished_at;
       if (report.success) {
@@ -814,6 +843,7 @@ export class RemoteSyncService {
         // Only a fully applied snapshot counts; the link reports this hash so the Primary can tell what is missing.
         this.proxyCatalog.applied_content_hash = manifest.content_hash;
         this.proxyCatalog.applied_change_hash = manifest.change_hash || null;
+        this.proxyCatalog.applied_objects = applier.objectState.entries;
         // Device settings now held for the Primary; edits to them on this remote are restored.
         if (!manifest.sections.includes("settings")) this.proxyCatalog.applied_settings = {};
         else if (applier.appliedSettings) this.proxyCatalog.applied_settings = applier.appliedSettings;

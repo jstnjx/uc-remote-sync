@@ -2,6 +2,7 @@ import { CoreApiError } from "../core/client.js";
 import { incrementReport } from "../shared/models.js";
 import { editableFields, firstIdentifier } from "../shared/util.js";
 import { logger } from "../shared/logger.js";
+import { configuredFieldsEqual, referencedMappings } from "./object-state.js";
 
 const log = logger("profile-applier");
 const PROFILE_FIELDS = new Set(["profile_id", "name", "icon", "description", "restricted", "settings"]);
@@ -17,6 +18,7 @@ export class ProfileApplier {
     client,
     config,
     mappings,
+    objectState,
     rewriteConfiguredReferences,
     configuredEntityIds,
     exists,
@@ -29,6 +31,7 @@ export class ProfileApplier {
     this.client = client;
     this.config = config;
     this.mappings = mappings;
+    this.objectState = objectState;
     this.rewriteConfiguredReferences = rewriteConfiguredReferences;
     this.configuredEntityIds = configuredEntityIds;
     this.exists = exists;
@@ -42,34 +45,46 @@ export class ProfileApplier {
     const currentIds = new Set();
     for (const record of payload.items || []) {
       const sourceId = String(record.source_id || "");
-      const detail = record.detail || {};
       if (!sourceId) continue;
       currentIds.add(sourceId);
       let targetId = this.mappings.get(sourceNode, "profile", sourceId) || sourceId;
-      const profilePayload = this.rewriteConfiguredReferences(editableFields(detail, PROFILE_FIELDS), mapping, report, `profile ${sourceId}`);
+      const profilePayload = this.rewriteConfiguredReferences(editableFields(record.detail || {}, PROFILE_FIELDS), mapping, report, `profile ${sourceId}`);
       delete profilePayload.profile_id;
+      const desired = { detail: profilePayload, pages: record.pages || [], groups: record.groups || [],
+        mapped_references: referencedMappings({ pages: record.pages || [], groups: record.groups || [] }, mapping) };
+      const observe = () => this.#observeProfile(targetId);
       try {
+        if (await this.objectState?.matches("profile", sourceId, targetId, desired, observe)) {
+          local[sourceId] = targetId;
+          mapping[sourceId] = targetId;
+          incrementReport(report, "profiles_skipped");
+          continue;
+        }
         const exists = await this.#profileExists(targetId);
+        const current = exists ? await this.#profileDetail(targetId) : null;
         let result;
-        if (typeof this.client.coreMessage === "function") {
-          try {
-            result = await this.client.coreMessage(exists ? "update_profile" : "add_profile", { ...profilePayload, profile_id: targetId }, 30_000);
-          } catch (error) {
-            if (!this.webSocketCompatibilityError(error)) throw error;
-            result = null;
+        if (!exists || !configuredFieldsEqual(current, profilePayload)) {
+          if (typeof this.client.coreMessage === "function") {
+            try {
+              result = await this.client.coreMessage(exists ? "update_profile" : "add_profile", { ...profilePayload, profile_id: targetId }, 30_000);
+            } catch (error) {
+              if (!this.webSocketCompatibilityError(error)) throw error;
+              result = null;
+            }
           }
-        }
-        if (result === null || result === undefined) {
-          if (exists) await this.client.json("PATCH", `/profiles/${encodeURIComponent(targetId)}`, { json: profilePayload, expected: [200] });
-          else result = await this.client.json("POST", "/profiles", { json: { ...profilePayload, profile_id: targetId }, expected: [200, 201] });
-        }
+          if (result === null || result === undefined) {
+            if (exists) await this.client.json("PATCH", `/profiles/${encodeURIComponent(targetId)}`, { json: profilePayload, expected: [200] });
+            else result = await this.client.json("POST", "/profiles", { json: { ...profilePayload, profile_id: targetId }, expected: [200, 201] });
+          }
+          incrementReport(report, exists ? "profiles_updated" : "profiles_created");
+        } else incrementReport(report, "profile_metadata_skipped");
         targetId = firstIdentifier(result?.profile || result, "profile_id", "id") || targetId;
-        incrementReport(report, exists ? "profiles_updated" : "profiles_created");
         this.mappings.set(sourceNode, "profile", sourceId, targetId);
         local[sourceId] = targetId;
         mapping[sourceId] = targetId;
         await this.#replaceChildren(sourceNode, sourceId, targetId, record, mapping, report);
         if (!(await this.#profileExists(targetId))) throw new Error(`Profile ${targetId} was not visible after apply`);
+        await this.objectState?.remember("profile", sourceId, targetId, desired, () => this.#observeProfile(targetId));
       } catch (error) {
         report.errors.push(`Profile ${sourceId}: ${error.message}`);
       }
@@ -78,53 +93,139 @@ export class ProfileApplier {
     if (!profileErrors.length && payload.active !== null && payload.active !== undefined) {
       const activeValue = payload.active?.profile || payload.active;
       const sourceActive = typeof activeValue === "object" ? firstIdentifier(activeValue, "profile_id", "id") : String(activeValue);
-      if (sourceActive) await this.#setActive(mapping[sourceActive] || sourceActive, report);
-    } else if (profileErrors.length) {
-      report.warnings.push("Active profile was not switched because profile restoration was incomplete");
-    }
+      if (sourceActive) {
+        const target = mapping[sourceActive] || sourceActive;
+        if (!(await this.objectState?.matches("active_profile", sourceNode, target, { profile_id: target }))) {
+          if (await this.#setActive(target, report)) {
+            await this.objectState?.remember("active_profile", sourceNode, target, { profile_id: target });
+          }
+        } else incrementReport(report, "active_profile_skipped");
+      }
+    } else if (profileErrors.length) report.warnings.push("Active profile was not switched because profile restoration was incomplete");
     if (this.config.sync.prune) await this.pruneMapped(sourceNode, "profile", "profiles", currentIds, report);
     return local;
   }
 
+  async #profileDetail(profileId) {
+    if (typeof this.client.coreMessage === "function") {
+      try {
+        const result = await this.client.coreMessage("get_profile", { profile_id: String(profileId) }, 15_000);
+        return result?.profile || result;
+      }
+      catch (error) { if (!this.webSocketCompatibilityError(error)) throw error; }
+    }
+    return this.client.getJson(`/profiles/${encodeURIComponent(profileId)}`, { optionalStatuses: [404] });
+  }
+
+  async #observeProfile(profileId) {
+    const detail = await this.#profileDetail(profileId);
+    if (!detail) return null;
+    const pages = await this.#listChildren(profileId, "pages");
+    const groups = await this.#listChildren(profileId, "groups");
+    return { detail, pages, groups };
+  }
+
   async #replaceChildren(sourceNode, sourceProfileId, profileId, record, mapping, report) {
-    const pages = Array.isArray(record.pages) ? record.pages : [];
     const groups = Array.isArray(record.groups) ? record.groups : [];
+    const pages = Array.isArray(record.pages) ? record.pages : [];
+    await this.#syncChildren(sourceNode, sourceProfileId, profileId, "groups", groups, mapping, report);
+    await this.#syncChildren(sourceNode, sourceProfileId, profileId, "pages", pages, mapping, report);
+    log.info(`Reconciled profile ${sourceProfileId} with ${pages.length} page(s) and ${groups.length} group(s)`);
+  }
 
-    await this.#resetChildren(profileId, "pages", report);
-    await this.#resetChildren(profileId, "groups", report);
-
-    for (const group of groups) {
-      const sourceGroupId = firstIdentifier(group, "group_id", "id");
-      const payload = this.rewriteConfiguredReferences(editableFields(group, PROFILE_GROUP_FIELDS), mapping, report, `profile ${sourceProfileId} group`);
-      const result = await this.#createChild(profileId, "group", payload);
-      const targetGroupId = firstIdentifier(result?.group || result, "group_id", "id");
-      if (!targetGroupId) throw new Error(`Created profile group ${sourceGroupId || "unknown"} did not return group_id`);
-      if (sourceGroupId) {
-        this.mappings.set(sourceNode, `profile_group:${sourceProfileId}`, sourceGroupId, targetGroupId);
-        mapping[sourceGroupId] = targetGroupId;
+  async #syncChildren(sourceNode, sourceProfileId, profileId, childName, desired, mapping, report) {
+    const isPage = childName === "pages";
+    const kind = isPage ? "page" : "group";
+    const idField = isPage ? "page_id" : "group_id";
+    const mappingKind = `profile_${kind}:${sourceProfileId}`;
+    const existing = await this.#listChildren(profileId, childName);
+    const used = new Set();
+    const staged = [];
+    // Empty collections can be reset without affecting the UI, retaining API
+    // compatibility with Cores that create an implicit blank page/group.
+    if (existing.length === 0) await this.#resetChildren(profileId, childName, report);
+    try {
+      for (const [index, item] of desired.entries()) {
+        const sourceId = firstIdentifier(item, idField, "id") || `index:${index}`;
+        const context = `profile ${sourceProfileId} ${kind} ${sourceId}`;
+        const raw = editableFields(item, isPage ? PAGE_FIELDS : PROFILE_GROUP_FIELDS);
+        const payload = this.rewriteConfiguredReferences(raw, mapping, report, context);
+        const adapted = isPage ? this.adaptPage(payload, context) : payload;
+        const mappedId = this.mappings.get(sourceNode, mappingKind, sourceId);
+        const candidate = existing.find((entry) => firstIdentifier(entry, idField, "id") === mappedId)
+          || existing.find((entry) => firstIdentifier(entry, idField, "id") === sourceId)
+          || (!mappedId && existing[index] && !used.has(String(firstIdentifier(existing[index], idField, "id"))) ? existing[index] : null);
+        const targetId = candidate ? firstIdentifier(candidate, idField, "id") : null;
+        const observe = async () => (await this.#listChildren(profileId, childName))
+          .find((entry) => firstIdentifier(entry, idField, "id") === targetId) || null;
+        if (targetId && await this.objectState?.matches(mappingKind, sourceId, targetId, adapted, observe)) {
+          used.add(String(targetId));
+          incrementReport(report, `profile_${childName}_skipped`);
+        } else if (targetId && configuredFieldsEqual(candidate, adapted)) {
+          used.add(String(targetId));
+          incrementReport(report, `profile_${childName}_skipped`);
+          await this.objectState?.remember(mappingKind, sourceId, targetId, adapted, observe);
+        } else if (targetId) {
+          if (isPage) await this.#updatePage(profileId, targetId, adapted);
+          else await this.#updateGroup(profileId, targetId, adapted);
+          used.add(String(targetId));
+          incrementReport(report, `profile_${childName}_updated`);
+          await this.objectState?.remember(mappingKind, sourceId, targetId, adapted, observe);
+        } else {
+          const created = isPage
+            ? await this.#createPage(profileId, adapted, report, context)
+            : await this.#createChild(profileId, "group", adapted);
+          const newId = firstIdentifier(created?.[kind] || created, idField, "id");
+          if (!newId) throw new Error(`${context}: Core did not return ${idField}`);
+          staged.push(String(newId));
+          used.add(String(newId));
+          incrementReport(report, `profile_${childName}_created`);
+          await this.objectState?.remember(mappingKind, sourceId, newId, adapted, async () =>
+            (await this.#listChildren(profileId, childName)).find((entry) => firstIdentifier(entry, idField, "id") === newId) || null);
+        }
+        if (!sourceId.startsWith("index:")) {
+          const id = targetId || staged[staged.length - 1];
+          this.mappings.set(sourceNode, mappingKind, sourceId, id);
+          mapping[sourceId] = id;
+        }
       }
-      incrementReport(report, "profile_groups_created");
-    }
-
-    for (const page of pages) {
-      const sourcePageId = firstIdentifier(page, "page_id", "id");
-      const context = `profile ${sourceProfileId} page ${sourcePageId || "unknown"}`;
-      const payload = this.adaptPage(this.rewriteConfiguredReferences(editableFields(page, PAGE_FIELDS), mapping, report, context), context);
-      const result = await this.#createPage(profileId, payload, report, context);
-      const targetPageId = firstIdentifier(result?.page || result, "page_id", "id");
-      if (!targetPageId) throw new Error(`Created profile page ${sourcePageId || "unknown"} did not return page_id`);
-      if (sourcePageId) {
-        this.mappings.set(sourceNode, `profile_page:${sourceProfileId}`, sourcePageId, targetPageId);
-        mapping[sourcePageId] = targetPageId;
+    } catch (error) {
+      // A validation failure must not destroy the previous layout. Delete only
+      // pages created by this attempt; existing pages remain in place.
+      for (const id of staged) {
+        try { await this.#deleteChild(profileId, kind, id); }
+        catch (rollbackError) { report.warnings.push(`Could not roll back ${kind} ${id}: ${rollbackError.message}`); }
       }
-      incrementReport(report, "profile_pages_created");
+      throw error;
     }
+    for (const item of existing) {
+      const id = firstIdentifier(item, idField, "id");
+      if (id && !used.has(String(id))) await this.#deleteChild(profileId, kind, id);
+    }
+    const visible = await this.#listChildren(profileId, childName);
+    if (visible.length !== desired.length) throw new Error(`Profile ${profileId} ${childName} verification failed: expected ${desired.length}, found ${visible.length}`);
+  }
 
-    const visiblePages = await this.#listChildren(profileId, "pages");
-    const visibleGroups = await this.#listChildren(profileId, "groups");
-    if (visiblePages.length !== pages.length) throw new Error(`Profile ${profileId} page verification failed: expected ${pages.length}, found ${visiblePages.length}`);
-    if (visibleGroups.length !== groups.length) throw new Error(`Profile ${profileId} group verification failed: expected ${groups.length}, found ${visibleGroups.length}`);
-    log.info(`Restored profile ${sourceProfileId} with ${pages.length} page(s) and ${groups.length} group(s)`);
+  async #deleteChild(profileId, kind, id) {
+    if (typeof this.client.coreMessage === "function") {
+      try {
+        await this.client.coreMessage(kind === "page" ? "delete_page" : "delete_group", {
+          profile_id: String(profileId), [`${kind}_id`]: String(id)
+        }, 30_000);
+        return;
+      } catch (error) { if (!this.webSocketCompatibilityError(error)) throw error; }
+    }
+    await this.client.json("DELETE", `/profiles/${encodeURIComponent(profileId)}/${kind}s/${encodeURIComponent(id)}`, { expected: [200, 204], optionalStatuses: [404] });
+  }
+
+  async #updateGroup(profileId, groupId, payload) {
+    if (typeof this.client.coreMessage === "function") {
+      try {
+        await this.client.coreMessage("update_group", { profile_id: String(profileId), group_id: String(groupId), ...payload }, 30_000);
+        return;
+      } catch (error) { if (!this.webSocketCompatibilityError(error)) throw error; }
+    }
+    await this.client.json("PATCH", `/profiles/${encodeURIComponent(profileId)}/groups/${encodeURIComponent(groupId)}`, { json: payload, expected: [200] });
   }
 
   async #profileExists(profileId) {
@@ -158,34 +259,19 @@ export class ProfileApplier {
     const configured = await this.configuredEntityIds();
     const { payload: sanitized, removed } = this.#sanitizePagePayload(payload, configured);
     if (removed > 0) report.warnings.push(`${context}: removed ${removed} structurally invalid or unavailable page item(s)`);
-
     const created = await this.#createPageShell(profileId, sanitized);
     const pageId = firstIdentifier(created?.page || created, "page_id", "id");
-    if (!pageId) throw new Error("Created profile page did not return page_id");
-
-    const applyPayload = async (value) => {
-      await this.#updatePage(profileId, pageId, value);
-      return { ...(created?.page || created || {}), ...value, page_id: pageId };
-    };
-
+    if (!pageId) throw new Error(`${context}: Core did not return a page ID`);
     try {
-      return await applyPayload(sanitized);
+      await this.#updatePage(profileId, pageId, sanitized);
     } catch (error) {
-      if (!this.#invalidPageEntitiesError(error)) throw error;
-      const shell = structuredClone(sanitized);
-      let cleared = 0;
-      for (const key of ["items", "entities"]) {
-        if (Array.isArray(shell[key]) && shell[key].length) {
-          cleared += shell[key].length;
-          shell[key] = [];
-        }
-      }
-      if (!cleared && Array.isArray(payload.items)) shell.items = [];
-      if (!cleared && Array.isArray(payload.entities)) shell.entities = [];
-      const result = await applyPayload(shell);
-      report.warnings.push(`${context}: Core rejected the page entity layout; created the page shell without ${cleared || "its"} invalid item(s)`);
-      return result;
+      // Never treat a rejected page as a successfully applied blank page.
+      // Remove the new shell and keep all pre-existing pages untouched.
+      try { await this.#deleteChild(profileId, "page", pageId); }
+      catch (rollbackError) { report.warnings.push(`${context}: could not remove rejected page shell ${pageId}: ${rollbackError.message}`); }
+      throw new Error(`${context}: Core rejected page content; old pages were preserved: ${error.message}`);
     }
+    return { ...(created?.page || created || {}), ...sanitized, page_id: pageId };
   }
 
   async #createPageShell(profileId, payload) {
@@ -205,7 +291,7 @@ export class ProfileApplier {
       try {
         return await this.client.coreMessage("update_page", { profile_id: String(profileId), page_id: String(pageId), ...payload }, 30_000);
       } catch (error) {
-        if (this.#invalidPageEntitiesError(error) || !this.webSocketCompatibilityError(error)) throw error;
+        if (this.#invalidPageEntitiesError(error) || this.#pageValidationError(error) || !this.webSocketCompatibilityError(error)) throw error;
       }
     }
     const endpoints = [
@@ -223,6 +309,12 @@ export class ProfileApplier {
       }
     }
     throw lastError || new Error(`Profile page ${pageId} could not be updated`);
+  }
+
+  #pageValidationError(error) {
+    const message = `${error?.message || ""} ${JSON.stringify(error?.body || {})}`;
+    return Number(error?.code || error?.status) === 400
+      && /validation|invalid .*widget|invalid .*config|feature not found|number_id|entity_id/i.test(message);
   }
 
   #invalidPageEntitiesError(error) {
@@ -293,7 +385,7 @@ export class ProfileApplier {
       try {
         await this.client.coreMessage("switch_profile", { profile_id: String(profileId) }, 30_000);
         incrementReport(report, "active_profile_updated");
-        return;
+        return true;
       } catch (error) {
         if (!this.webSocketCompatibilityError(error)) report.warnings.push(`Set active profile through Core WebSocket failed: ${error.message}`);
       }
@@ -308,11 +400,12 @@ export class ProfileApplier {
       try {
         await this.client.json(method, endpoint, { json: body, params, expected: [200, 204] });
         incrementReport(report, "active_profile_updated");
-        return;
+        return true;
       } catch (error) {
         if (!(error instanceof CoreApiError) || ![404, 405].includes(error.status)) report.warnings.push(`Set active profile attempt failed: ${error.message}`);
       }
     }
     report.warnings.push("Active profile endpoint was not available on this Core API version");
+    return false;
   }
 }

@@ -48,12 +48,19 @@ function mergeAvailableMetadata(configured, available) {
 // Change detection
 // -----------------------------------------------------------------------------
 
-const VOLATILE_KEYS = new Set(["attributes", "state", "device_state", "driver_state", "connection_state", "connected", "online", "last_seen", "updated_at", "media_position_updated_at"]);
+const VOLATILE_KEYS = new Set(["attributes", "state", "device_state", "driver_state", "connection_state", "connected", "online", "last_seen", "updated_at", "last_updated", "last_changed", "media_position_updated_at", "available", "status", "last_seen_at", "last_event_at", "last_update", "uptime", "signal_strength", "battery_level"]);
 
-export function stableConfiguration(value) {
-  if (Array.isArray(value)) return value.map(stableConfiguration);
+// Status fields inside widget/options configuration may be meaningful choices.
+// Only remove those generic runtime flags outside authored config subtrees.
+const CONFIGURED_SUBTREES = new Set(["options", "settings", "pages", "items", "grid", "buttons", "sequences"]);
+
+export function stableConfiguration(value, path = []) {
+  if (Array.isArray(value)) return value.map((entry) => stableConfiguration(entry, path));
   if (value && typeof value === "object") {
-    return Object.fromEntries(Object.entries(value).filter(([key]) => !VOLATILE_KEYS.has(key)).map(([key, item]) => [key, stableConfiguration(item)]));
+    return Object.fromEntries(Object.entries(value)
+      .filter(([key]) => !VOLATILE_KEYS.has(key)
+        || (["available", "status"].includes(key) && path.some((part) => CONFIGURED_SUBTREES.has(part))))
+      .map(([key, item]) => [key, stableConfiguration(item, [...path, key])]));
   }
   return value;
 }

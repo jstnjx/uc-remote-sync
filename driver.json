@@ -1,6 +1,6 @@
 {
   "driver_id": "remote_sync",
-  "version": "0.11.3",
+  "version": "0.11.4",
   "min_core_api": "0.17.0",
   "name": {
     "en": "Remote Sync"
@@ -50,5 +50,5 @@
       }
     ]
   },
-  "release_date": "2026-11-05"
+  "release_date": "2026-11-13"
 }

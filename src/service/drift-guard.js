@@ -67,6 +67,7 @@ export class DriftGuard {
     this.timer = null;
     this.lastDrift = null;
     this.reverted = 0;
+    this.lastIntegrityCheck = null;
   }
 
   stop() { clearTimeout(this.timer); this.timer = null; clearTimeout(this.settingsTimer); this.settingsTimer = null; }
@@ -79,7 +80,7 @@ export class DriftGuard {
   endApply() { this.applying = Math.max(0, this.applying - 1); this.quietUntil = Date.now() + this.applyGraceMs; }
   get suppressed() { return this.applying > 0 || Date.now() < this.quietUntil; }
 
-  status() { return { last_drift: this.lastDrift, reverted_objects: this.reverted, restored_settings: this.settingsRestored, checks: this.verified, pending: this.pending.size + this.unsent.length }; }
+  status() { return { last_drift: this.lastDrift, reverted_objects: this.reverted, restored_settings: this.settingsRestored, checks: this.verified, last_integrity_check: this.lastIntegrityCheck, pending: this.pending.size + this.unsent.length }; }
 
   #mapped(kinds) {
     const sourceNode = this.getSourceNode();
@@ -176,9 +177,14 @@ export class DriftGuard {
     const detail = await client.getJson(DETAIL_PATHS[kind](id), { optionalStatuses: [404] });
     if (!detail) return null;
     const parts = { detail: stableConfiguration(detail) };
+    if (kind === "activity" || kind === "macro") {
+      // The Core can change a button mapping or a page without modifying the
+      // parent entity detail. These are configuration drift, not live state.
+      parts.buttons = stableConfiguration(await client.getJson(`${DETAIL_PATHS[kind](id)}/buttons`, { optionalStatuses: [404, 405] }));
+      parts.ui = stableConfiguration(await client.getJson(`${DETAIL_PATHS[kind](id)}/ui`, { optionalStatuses: [404, 405] }));
+    }
     for (const child of CHILD_LISTS[kind] || []) {
-      try { parts[child] = stableConfiguration(await client.listPaginated(`${DETAIL_PATHS[kind](id)}/${child}`, { optional: true })); }
-      catch { parts[child] = null; }
+      parts[child] = stableConfiguration(await client.listPaginated(`${DETAIL_PATHS[kind](id)}/${child}`, { optional: true }));
     }
     return sha256Bytes(canonicalJson(parts));
   }
@@ -198,17 +204,41 @@ export class DriftGuard {
 
   // True when every synchronized object still looks exactly as Remote Sync left it (and nothing is waiting to be
   // restored). An automatic synchronization of an unchanged configuration is then skipped entirely.
-  async intact() {
-    if (!this.fingerprints.size || this.pending.size || this.unsent.length || this.pendingSettings) return false;
+  async integrityReport() {
+    const fail = (reason, details = {}) => {
+      const result = { intact: false, reason, ...details };
+      this.lastIntegrityCheck = result;
+      log.info(`Configuration integrity check: ${reason}${details.key ? ` (${details.key})` : ""}`);
+      return result;
+    };
+    if (!this.fingerprints.size) return fail("no saved fingerprints");
+    if (this.pending.size) {
+      // Activity state transitions can produce entity_change events even when
+      // no configuration was edited. Verify before invalidating a skip.
+      const candidates = [...this.pending.entries()];
+      const drift = await this.#verify(candidates.map(([, item]) => item));
+      if (drift.length) return fail("pending edited configuration", { count: drift.length, key: `${drift[0].kind}|${drift[0].id}` });
+      for (const [key, candidate] of candidates) {
+        if (this.pending.get(key) === candidate) this.pending.delete(key);
+      }
+    }
+    if (this.unsent.length) return fail("unreported local changes", { count: this.unsent.length });
+    if (this.pendingSettings) return fail("pending device settings restoration");
     for (const [key, expected] of this.fingerprints) {
       const [kind, id] = key.split("|");
       let actual;
-      try { actual = await this.#fingerprint(kind, id); } catch { return false; }
+      try { actual = await this.#fingerprint(kind, id); }
+      catch (error) { return fail("object read failed", { key, error: error.message }); }
       this.verified += 1;
-      if (actual !== expected) return false;
+      if (actual !== expected) return fail(actual === null ? "object missing" : "object fingerprint changed", {
+        key, expected_hash: expected, actual_hash: actual
+      });
     }
-    return true;
+    this.lastIntegrityCheck = { intact: true, checked: this.fingerprints.size };
+    return this.lastIntegrityCheck;
   }
+
+  async intact() { return (await this.integrityReport()).intact; }
 
   restoreFingerprints(value) {
     this.fingerprints = new Map(Object.entries(value && typeof value === "object" ? value : {}));

@@ -30,8 +30,8 @@ npm run package
 Generated installation files:
 
 ```text
-remote-sync-0.11.3.tar.gz
-remote-sync-0.11.3.tar.gz.sha256
+remote-sync-0.11.4.tar.gz
+remote-sync-0.11.4.tar.gz.sha256
 ```
 
 Tests remain in the source repository but are not copied into the Remote installation archive. The archive is produced by `src/shared/package.js`, the same builder a Primary uses at runtime to install Remote Sync on Satellites. The version is read from `driver.json`; `package.json` must match it.
@@ -39,7 +39,7 @@ Tests remain in the source repository but are not copied into the Remote install
 ## Install on Remote Two/3
 
 1. Open **Web Configurator → Integrations → Add new → Install custom**.
-2. Select `remote-sync-0.11.3.tar.gz`.
+2. Select `remote-sync-0.11.4.tar.gz`.
 3. Select **Update existing driver** when upgrading.
 4. Only the Primary has to be installed by hand. Satellites added by address and PIN are installed and kept on the Primary's version automatically. For Satellites paired with a token (0.8.x style), update them before the Primary.
 

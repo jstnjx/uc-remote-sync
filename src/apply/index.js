@@ -7,6 +7,7 @@ import { ProfileApplier } from "./profiles.js";
 import { DockApplier } from "./docks.js";
 import { HardwareAdapter } from "./hardware.js";
 import { applyDeviceSettings } from "./settings.js";
+import { AppliedObjectState, configuredFieldsEqual } from "./object-state.js";
 
 // -----------------------------------------------------------------------------
 // Payload schemas
@@ -25,7 +26,7 @@ const READ_ONLY_KEYS = new Set(["entity_type", "integration_id", "features", "at
 // -----------------------------------------------------------------------------
 
 export class SnapshotApplier {
-  constructor(client, config, operationCache, mappings, { hardware = null } = {}) {
+  constructor(client, config, operationCache, mappings, { hardware = null, appliedObjects = {} } = {}) {
     this.client = client;
     this.config = config;
     this.operationCache = operationCache;
@@ -33,6 +34,7 @@ export class SnapshotApplier {
     // Adapts button mappings and UI pages from the Primary's hardware to this remote's (Remote Two ↔ Remote 3).
     this.hardware = hardware || new HardwareAdapter(null, null);
     this.appliedSettings = null;
+    this.objectState = new AppliedObjectState(appliedObjects);
   }
 
   // -------------------------------------------------------------------------
@@ -50,8 +52,16 @@ export class SnapshotApplier {
       };
       if (this.config.sync.use_standby_inhibitor) {
         const inhibitorId = `remote-sync-${manifest.operation_id.slice(0, 12)}`;
-        try { await this.client.withStandbyInhibitor(inhibitorId, "Remote Sync", `Applying proxy snapshot from ${manifest.source_name}`, apply); }
-        catch (error) {
+        let applyStarted = false;
+        try {
+          await this.client.withStandbyInhibitor(inhibitorId, "Remote Sync", `Applying proxy snapshot from ${manifest.source_name}`, async () => {
+            applyStarted = true;
+            await apply();
+          });
+        } catch (error) {
+          // If the callback itself failed, rerunning it duplicates destructive
+          // writes. Only fall back when acquiring the inhibitor failed.
+          if (applyStarted) throw error;
           report.warnings.push(`Standby inhibitor unavailable; continuing sync: ${error.message}`);
           await apply();
         }
@@ -150,7 +160,9 @@ export class SnapshotApplier {
   async #applyProxyEntities(entities, previousEntities, report) {
     const descriptors = (entities || []).filter((item) => item && item.target_entity_id && item.local_id);
     const currentIds = new Set(descriptors.map((item) => String(item.target_entity_id)));
-    const configuredIds = await this.#configuredEntityIds();
+    const configuredEntities = await this.client.listPaginated("/entities", { pageSize: 100 });
+    const configuredIds = new Set(configuredEntities.map((item) => firstIdentifier(item, "entity_id", "id")).filter(Boolean).map(String));
+    const configuredById = new Map(configuredEntities.map((item) => [String(firstIdentifier(item, "entity_id", "id") || ""), item]));
     const missing = descriptors.filter((descriptor) => !configuredIds.has(String(descriptor.target_entity_id)));
 
     if (missing.length) {
@@ -165,8 +177,19 @@ export class SnapshotApplier {
     for (const descriptor of descriptors) {
       const payload = this.#proxyEditablePayload(descriptor);
       if (!Object.keys(payload).length) continue;
+      const current = configuredById.get(String(descriptor.target_entity_id));
+      const metadataVisible = Object.keys(payload).every((key) => Object.hasOwn(current || {}, key));
+      const matchesCore = configuredFieldsEqual(current, payload);
+      const matchesRecorded = !metadataVisible && await this.objectState.matches(
+        "proxy_metadata", descriptor.source_entity_id, descriptor.target_entity_id, payload);
+      if (matchesCore || matchesRecorded) {
+        incrementReport(report, "proxy_entities_skipped");
+        if (matchesCore) await this.objectState.remember("proxy_metadata", descriptor.source_entity_id, descriptor.target_entity_id, payload);
+        continue;
+      }
       try {
         await this.client.json("PATCH", `/entities/${encodeURIComponent(String(descriptor.target_entity_id))}`, { json: payload, expected: [200] });
+        await this.objectState.remember("proxy_metadata", descriptor.source_entity_id, descriptor.target_entity_id, payload);
         incrementReport(report, "proxy_entities_updated");
       } catch (error) {
         failures.push(`${descriptor.source_entity_id}: ${error.message}`);
@@ -302,24 +325,66 @@ export class SnapshotApplier {
       const uiPayload = record.ui !== undefined
         ? this.hardware.ui(this.#rewriteConfiguredReferences(record.ui || {}, mapping, report, `${context} UI`), `${context} UI`)
         : undefined;
+      const desired = { detail: updatePayload, buttons: buttonPayload, ui: uiPayload };
+      const kindKey = `${section}:${sourceId}`;
+      const observe = () => this.#observeInternalEntity(section, targetId);
       try {
-        await this.#updateInternalEntity(section, targetId, updatePayload, buttonPayload, uiPayload, context, report);
+        if (await this.objectState.matches("internal", kindKey, targetId, desired, observe)) {
+          incrementReport(report, `${section}_skipped`);
+          continue;
+        }
+        const detailDesired = { updatePayload,
+          assignedEntityIds: section === "activities"
+            ? this.#activityEntityIds(updatePayload?.options || {}, buttonPayload, uiPayload) : null };
+        const observeDetail = () => this.#observeInternalPart(section, targetId, "detail");
+        const observeButtons = () => this.#observeInternalPart(section, targetId, "buttons");
+        const observeUi = () => this.#observeInternalPart(section, targetId, "ui");
+        if (!(await this.objectState.matches("internal_detail", kindKey, targetId, detailDesired, observeDetail))) {
+          await this.#updateInternalEntity(section, targetId, updatePayload, buttonPayload, uiPayload, context, report);
+          await this.objectState.remember("internal_detail", kindKey, targetId, detailDesired, observeDetail);
+        } else incrementReport(report, `${section}_metadata_skipped`);
         if (buttonPayload !== undefined) {
-          try {
-            await this.client.requestFirst([
-              { kind: "json", method: "PATCH", path: `/${section}/${encodeURIComponent(targetId)}/buttons`, options: { json: buttonPayload, expected: [200] } },
-              { kind: "json", method: "POST", path: `/${section}/${encodeURIComponent(targetId)}/buttons`, options: { json: buttonPayload, expected: [200] } }
-            ]);
-          } catch (error) {
-            if (!(error instanceof CoreApiError) || ![404, 405].includes(error.status)) throw error;
-            report.warnings.push(`Button mappings are not supported for ${section} ${targetId} on this Core API version`);
+          if (await this.objectState.matches("internal_buttons", kindKey, targetId, buttonPayload, observeButtons)) {
+            incrementReport(report, `${section}_buttons_skipped`);
+          } else {
+            try {
+              await this.client.requestFirst([
+                { kind: "json", method: "PATCH", path: `/${section}/${encodeURIComponent(targetId)}/buttons`, options: { json: buttonPayload, expected: [200] } },
+                { kind: "json", method: "POST", path: `/${section}/${encodeURIComponent(targetId)}/buttons`, options: { json: buttonPayload, expected: [200] } }
+              ]);
+            } catch (error) {
+              if (!(error instanceof CoreApiError) || ![404, 405].includes(error.status)) throw error;
+              report.warnings.push(`Button mappings are not supported for ${section} ${targetId} on this Core API version`);
+            }
+            await this.objectState.remember("internal_buttons", kindKey, targetId, buttonPayload, observeButtons);
           }
         }
-        if (uiPayload !== undefined) await this.#replaceUi(section, targetId, uiPayload, mapping, report, true);
+        if (uiPayload !== undefined) {
+          if (await this.objectState.matches("internal_ui", kindKey, targetId, uiPayload, observeUi)) {
+            incrementReport(report, `${section}_ui_skipped`);
+          } else {
+            await this.#replaceUi(section, targetId, uiPayload, mapping, report, true);
+            await this.objectState.remember("internal_ui", kindKey, targetId, uiPayload, observeUi);
+          }
+        }
+        await this.objectState.remember("internal", kindKey, targetId, desired, observe);
         incrementReport(report, `${section}_updated`);
       } catch (error) { report.errors.push(`Update ${kind} ${sourceId}: ${error.message}`); }
     }
     if (this.config.sync.prune) await this.#pruneMapped(sourceNode, kind, section, stage.currentIds, report);
+  }
+
+  async #observeInternalPart(section, targetId, part) {
+    const base = `/${section}/${encodeURIComponent(targetId)}`;
+    return this.client.getJson(part === "detail" ? base : `${base}/${part}`, { optionalStatuses: [404, 405] });
+  }
+
+  async #observeInternalEntity(section, targetId) {
+    const detail = await this.#observeInternalPart(section, targetId, "detail");
+    if (!detail) return null;
+    const buttons = await this.#observeInternalPart(section, targetId, "buttons");
+    const ui = await this.#observeInternalPart(section, targetId, "ui");
+    return { detail, buttons, ui };
   }
 
   async #updateInternalEntity(section, targetId, updatePayload, buttonPayload, uiPayload, context, report) {
@@ -373,55 +438,71 @@ export class SnapshotApplier {
     return result;
   }
 
+  // Core validates pages only when they are created. Create and validate every
+  // replacement before deleting any existing page. Roll back staged pages if
+  // validation fails; never report a partial UI replacement as successful.
   async #replaceUi(section, targetId, ui, mapping, report, alreadyRewritten = false) {
     const base = `/${section}/${encodeURIComponent(targetId)}/ui`;
     const pages = Array.isArray(ui?.pages) ? ui.pages : [];
     const existingUi = await this.client.getJson(base, { optionalStatuses: [404, 405] });
     const existingPages = this.#responseList(existingUi, "pages");
-    let individualDeleteWorked = existingPages.length === 0;
+    const staged = [];
+    try {
+      for (const page of pages) {
+        const sourcePageId = firstIdentifier(page, "page_id", "id");
+        const payload = alreadyRewritten
+          ? editableFields(page, PAGE_FIELDS)
+          : this.#rewriteConfiguredReferences(editableFields(page, PAGE_FIELDS), mapping, report, `${section} ${targetId} page`);
+        const created = await this.client.json("POST", `${base}/pages`, { json: payload, expected: [200, 201] });
+        const pageId = firstIdentifier(created, "page_id", "id");
+        if (!pageId) throw new Error("Core did not return an ID for the staged UI page; keeping existing pages");
+        staged.push({ sourcePageId, targetPageId: String(pageId), payload });
+      }
+    } catch (error) {
+      for (const page of staged) {
+        try { await this.client.json("DELETE", `${base}/pages/${encodeURIComponent(page.targetPageId)}`, { expected: [200, 204], optionalStatuses: [404] }); }
+        catch (rollbackError) { report.warnings.push(`Could not roll back staged ${section} UI page ${page.targetPageId}: ${rollbackError.message}`); }
+      }
+      throw new Error(`Rejected ${section} UI replacement for ${targetId}; previous pages preserved: ${error.message}`);
+    }
     for (const page of existingPages) {
       const pageId = firstIdentifier(page, "page_id", "id");
       if (!pageId) continue;
       try {
-        await this.client.json("DELETE", `${base}/pages/${encodeURIComponent(pageId)}`, { expected: [200, 204], optionalStatuses: [404, 405] });
-        individualDeleteWorked = true;
+        await this.client.json("DELETE", `${base}/pages/${encodeURIComponent(pageId)}`, { expected: [200, 204], optionalStatuses: [404] });
       } catch (error) {
-        report.warnings.push(`Could not delete existing ${section} UI page ${pageId}: ${error.message}`);
+        throw new Error(`New ${section} pages were staged, but deleting old page ${pageId} failed: ${error.message}`);
       }
     }
-    if (!individualDeleteWorked) {
-      try { await this.client.json("DELETE", base, { expected: [200, 204], optionalStatuses: [404, 405] }); }
-      catch (error) { report.warnings.push(`Could not reset ${section} UI for ${targetId}: ${error.message}`); }
-    }
-
-    const createdIds = new Set();
-    for (const page of pages) {
-      const sourcePageId = firstIdentifier(page, "page_id", "id");
-      const payload = alreadyRewritten
-        ? editableFields(page, PAGE_FIELDS)
-        : this.#rewriteConfiguredReferences(editableFields(page, PAGE_FIELDS), mapping, report, `${section} ${targetId} page`);
-      try {
-        const created = await this.client.json("POST", `${base}/pages`, { json: payload, expected: [200, 201], optionalStatuses: [404, 405] });
-        const targetPageId = firstIdentifier(created, "page_id", "id");
-        if (targetPageId) createdIds.add(String(targetPageId));
-        if (sourcePageId && targetPageId) mapping[sourcePageId] = targetPageId;
-      } catch (error) { report.warnings.push(`Could not create ${section} UI page: ${error.message}`); }
-    }
-
-    const finalUi = await this.client.getJson(base, { optionalStatuses: [404, 405] });
-    const finalPages = this.#responseList(finalUi, "pages");
-    if (pages.length > 0 && createdIds.size === pages.length && finalPages.length > pages.length) {
+    // Some Core versions generate a blank page (or reset the page list) when
+    // the last original page disappears. The replacements have already passed
+    // Core validation; restore them if the Core discarded them during deletion.
+    let finalUi = await this.client.getJson(base, { optionalStatuses: [404, 405] });
+    let finalPages = this.#responseList(finalUi, "pages");
+    if (finalUi) {
+      for (const item of staged) {
+        if (finalPages.some((page) => String(firstIdentifier(page, "page_id", "id")) === item.targetPageId)) continue;
+        const created = await this.client.json("POST", `${base}/pages`, { json: item.payload, expected: [200, 201] });
+        const newId = firstIdentifier(created, "page_id", "id");
+        if (!newId) throw new Error(`Core discarded staged ${section} page and did not return an ID when restoring it`);
+        item.targetPageId = String(newId);
+      }
+      finalUi = await this.client.getJson(base, { optionalStatuses: [404, 405] });
+      finalPages = this.#responseList(finalUi, "pages");
       for (const page of finalPages) {
-        const pageId = firstIdentifier(page, "page_id", "id");
-        if (!pageId || createdIds.has(String(pageId))) continue;
-        const items = Array.isArray(page?.items) ? page.items : [];
-        if (items.length) continue;
-        try {
-          await this.client.json("DELETE", `${base}/pages/${encodeURIComponent(pageId)}`, { expected: [200, 204], optionalStatuses: [404, 405] });
-          incrementReport(report, `${section}_blank_pages_removed`);
-        } catch (error) { report.warnings.push(`Could not remove generated blank ${section} UI page ${pageId}: ${error.message}`); }
+        const id = firstIdentifier(page, "page_id", "id");
+        if (!id || staged.some((item) => item.targetPageId === String(id))) continue;
+        if ((Array.isArray(page.items) && page.items.length) || (Array.isArray(page.entities) && page.entities.length)) continue;
+        await this.client.json("DELETE", `${base}/pages/${encodeURIComponent(id)}`, { expected: [200, 204], optionalStatuses: [404] });
+        incrementReport(report, `${section}_blank_pages_removed`);
+      }
+      finalUi = await this.client.getJson(base, { optionalStatuses: [404, 405] });
+      finalPages = this.#responseList(finalUi, "pages");
+      if (finalPages.length !== staged.length) {
+        throw new Error(`UI replacement verification failed for ${targetId}: expected ${staged.length} pages, found ${finalPages.length}`);
       }
     }
+    for (const page of staged) if (page.sourcePageId) mapping[page.sourcePageId] = page.targetPageId;
   }
 
   // -------------------------------------------------------------------------
@@ -461,6 +542,14 @@ export class SnapshotApplier {
       delete metadata.activity_ids;
       let targetId = this.mappings.get(sourceNode, "activity_group", sourceId);
       try {
+        const groupDesired = { metadata, targetActivityIds };
+        const observeGroup = () => this.client.getJson(`/activity_groups/${encodeURIComponent(targetId)}`, { optionalStatuses: [404] });
+        if (targetId && await this.objectState.matches("activity_group", sourceId, targetId, groupDesired, observeGroup)) {
+          local[sourceId] = targetId;
+          mapping[sourceId] = targetId;
+          incrementReport(report, "activity_groups_skipped");
+          continue;
+        }
         if (targetId && await this.#exists(`/activity_groups/${encodeURIComponent(targetId)}`)) {
           if (Object.keys(metadata).length) await this.client.json("PATCH", `/activity_groups/${encodeURIComponent(targetId)}`, { json: metadata, expected: [200] });
           incrementReport(report, "activity_groups_updated");
@@ -477,11 +566,16 @@ export class SnapshotApplier {
         this.mappings.set(sourceNode, "activity_group", sourceId, targetId);
         local[sourceId] = targetId;
         mapping[sourceId] = targetId;
-        plans.push({ sourceId, targetId: String(targetId), targetActivityIds, context });
+        plans.push({ sourceId, targetId: String(targetId), targetActivityIds, context, metadata });
       } catch (error) { report.errors.push(`Activity group ${sourceId}: ${error.message}`); }
     }
 
     await this.#applyGroupMembership(plans, report);
+    if (!report.errors.length) for (const plan of plans) {
+      await this.objectState.remember("activity_group", plan.sourceId, plan.targetId,
+        { metadata: plan.metadata, targetActivityIds: plan.targetActivityIds },
+        () => this.client.getJson(`/activity_groups/${encodeURIComponent(plan.targetId)}`, { optionalStatuses: [404] }));
+    }
     if (this.config.sync.prune) await this.#pruneMapped(sourceNode, "activity_group", "activity_groups", currentIds, report);
     return local;
   }
@@ -559,6 +653,7 @@ export class SnapshotApplier {
       client: this.client,
       config: this.config,
       mappings: this.mappings,
+      objectState: this.objectState,
       rewriteConfiguredReferences: (value, mapping, report, context) => this.#rewriteConfiguredReferences(value, mapping, report, context),
       configuredEntityIds: () => this.#configuredEntityIds(),
       exists: (endpoint) => this.#exists(endpoint),
